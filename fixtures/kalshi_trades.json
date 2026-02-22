@@ -1,0 +1,9 @@
+{
+  "by_ticker": {
+    "KX.CPI.2026-01": {"ticker":"KX.CPI.2026-01","trades":[{"count":12},{"count":10},{"count":8}]},
+    "KX.FED.CUT.JUN2026": {"ticker":"KX.FED.CUT.JUN2026","trades":[{"count":11},{"count":9}]},
+    "KX.NFL.CHIEFS.PO2026": {"ticker":"KX.NFL.CHIEFS.PO2026","trades":[{"count":8},{"count":7}]},
+    "KX.BTC.100K.2026": {"ticker":"KX.BTC.100K.2026","trades":[{"count":7},{"count":6}]},
+    "KX.NYC.MAYOR.2026": {"ticker":"KX.NYC.MAYOR.2026","trades":[{"count":5},{"count":4}]}
+  }
+}

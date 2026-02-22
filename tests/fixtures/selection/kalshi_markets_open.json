@@ -1,0 +1,8 @@
+{
+  "markets": [
+    {"ticker":"KXMVESPORTSMULTIGAMEEXTENDED-ABC","title":"MVE bundle","question":"MVE bundle question","open_interest":1000},
+    {"ticker":"KX.REGULAR.1","title":"Regular One","question":"Regular One question","open_interest":900},
+    {"ticker":"KX.REGULAR.2","title":"Regular Two","question":"Regular Two question","open_interest":800},
+    {"ticker":"KX.REGULAR.3","title":"Regular Three","question":"Regular Three question","open_interest":700}
+  ]
+}

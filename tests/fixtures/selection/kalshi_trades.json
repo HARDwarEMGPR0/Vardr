@@ -1,0 +1,8 @@
+{
+  "by_ticker": {
+    "KXMVESPORTSMULTIGAMEEXTENDED-ABC": {"ticker":"KXMVESPORTSMULTIGAMEEXTENDED-ABC","trades":[{"count":2}]},
+    "KX.REGULAR.1": {"ticker":"KX.REGULAR.1","trades":[{"count":3}]},
+    "KX.REGULAR.2": {"ticker":"KX.REGULAR.2","trades":[{"count":1}]},
+    "KX.REGULAR.3": {"ticker":"KX.REGULAR.3","trades":[{"count":4}]}
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "by_ticker": {
+    "KXMVESPORTSMULTIGAMEEXTENDED-ABC": {"ticker":"KXMVESPORTSMULTIGAMEEXTENDED-ABC","orderbook":{"yes":[[55,100]],"no":[[43,100]]}},
+    "KX.REGULAR.1": {"ticker":"KX.REGULAR.1","orderbook":{"yes":[[60,120]],"no":[[38,120]]}},
+    "KX.REGULAR.2": {"ticker":"KX.REGULAR.2","orderbook":{"yes":[[48,100]],"no":null}},
+    "KX.REGULAR.3": {"ticker":"KX.REGULAR.3","orderbook":{"yes":[[52,90]],"no":[[46,90]]}}
+  }
+}

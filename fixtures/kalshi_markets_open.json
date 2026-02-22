@@ -1,0 +1,9 @@
+{
+  "markets": [
+    {"ticker":"KX.CPI.2026-01","title":"Will CPI YoY be above 3.0% in Jan 2026?","question":"Will CPI YoY be above 3.0% in Jan 2026?","close_time":"2026-01-31T23:59:59Z","open_interest":1900},
+    {"ticker":"KX.FED.CUT.JUN2026","title":"Will the Fed cut rates by June 2026?","question":"Will the Fed cut rates by June 2026?","close_time":"2026-06-30T23:59:59Z","open_interest":1750},
+    {"ticker":"KX.NFL.CHIEFS.PO2026","title":"Will the Chiefs make the playoffs in 2026?","question":"Will the Chiefs make the playoffs in 2026?","close_time":"2026-12-01T23:59:59Z","open_interest":1400},
+    {"ticker":"KX.BTC.100K.2026","title":"Will BTC hit 100000 by end of 2026?","question":"Will BTC hit 100000 by end of 2026?","close_time":"2026-12-31T23:59:59Z","open_interest":1250},
+    {"ticker":"KX.NYC.MAYOR.2026","title":"Will candidate A win NYC mayor race 2026?","question":"Will candidate A win NYC mayor race 2026?","close_time":"2026-11-04T23:59:59Z","open_interest":980}
+  ]
+}
