@@ -2,11 +2,13 @@ import json
 import tempfile
 from pathlib import Path
 
+import market_fetcher.intelligence as intelligence
 from market_fetcher.intelligence import (
     find_opportunities,
     detect_inconsistencies,
     detect_reference_event_clusters,
     detect_lagging_correlated_markets,
+    score_market_relationship,
 )
 from market_fetcher.leader_markets import load_leader_markets
 
@@ -165,8 +167,112 @@ def test_detect_lagging_correlated_markets_flags_laggard():
     assert s["type"] == "lagging_correlated_market"
     assert s["leader_market_key"] == "btc-100k"
     assert s["laggard_market_key"] == "btc-etf"
-    assert s["relationship"] == "shared_keyword_theme"
+    assert s["relationship"] == "same_semantic_group"
+    assert s["relationship_score"] >= 0.45
+    assert s["relationship_reasons"]
+    assert s["expected_direction"] == "same"
     assert "reason" in s
+
+
+def test_self_market_key_does_not_emit_lag_signal():
+    leader = {
+        "title": "Will Bitcoin hit 100k this year?",
+        "market_key": "btc-same",
+        "one_hour_price_change": 0.08,
+    }
+    laggard = {
+        "title": "Will Bitcoin hit 100k this year?",
+        "market_key": "btc-same",
+        "one_hour_price_change": 0.0,
+    }
+
+    assert detect_lagging_correlated_markets([laggard], [leader]) == []
+
+
+def test_same_normalized_title_does_not_emit_lag_signal():
+    leader = {
+        "title": "Will Bitcoin hit 100k this year?",
+        "market_key": "btc-leader",
+        "one_hour_price_change": 0.08,
+    }
+    laggard = {
+        "title": "Will Bitcoin hit 100k this year!!!",
+        "market_key": "btc-laggard",
+        "one_hour_price_change": 0.0,
+    }
+
+    assert detect_lagging_correlated_markets([laggard], [leader]) == []
+
+
+def test_reference_event_only_match_does_not_emit_lag_signal():
+    leader = {
+        "title": "Will Bitcoin reach a new high before GTA VI?",
+        "market_key": "btc-gta",
+        "one_hour_price_change": 0.08,
+    }
+    laggard = {
+        "title": "Will Jesus return before GTA VI?",
+        "market_key": "jesus-gta",
+        "reference_event": "GTA VI",
+        "one_hour_price_change": 0.0,
+    }
+
+    signals = detect_lagging_correlated_markets([laggard], [leader])
+    assert signals == []
+    relationship = score_market_relationship(leader, laggard)
+    assert relationship["relationship"] == "reference_event_only"
+    assert relationship["expected_direction"] == "unknown"
+
+
+def test_crypto_leader_emits_signal_for_unmoved_crypto_laggard():
+    leader = {
+        "title": "Will Bitcoin rally before GTA VI?",
+        "market_key": "btc-gta",
+        "one_hour_price_change": 0.08,
+    }
+    laggard = {
+        "title": "Will MicroStrategy stock rise with Bitcoin?",
+        "market_key": "mstr-btc",
+        "one_hour_price_change": 0.0,
+    }
+
+    signals = detect_lagging_correlated_markets([laggard], [leader])
+    assert len(signals) == 1
+    assert signals[0]["relationship"] == "same_semantic_group"
+
+
+def test_crypto_leader_does_not_emit_for_geopolitics_laggard_with_same_gta_reference():
+    leader = {
+        "title": "Will Bitcoin rally before GTA VI?",
+        "market_key": "btc-gta",
+        "reference_event": "GTA VI",
+        "one_hour_price_change": 0.08,
+    }
+    laggard = {
+        "title": "Will China invade Taiwan before GTA VI?",
+        "market_key": "china-taiwan-gta",
+        "reference_event": "GTA VI",
+        "one_hour_price_change": 0.0,
+    }
+
+    assert detect_lagging_correlated_markets([laggard], [leader]) == []
+
+
+def test_no_emitted_signal_uses_shared_keyword_theme_relationship():
+    leader = {
+        "title": "Will Bitcoin ETF hit record high?",
+        "market_key": "btc-leader",
+        "computed_mid_delta": 0.05,
+    }
+    laggard = {
+        "title": "Will Bitcoin ETF get approval?",
+        "market_key": "btc-laggard",
+        "computed_mid_delta": 0.0,
+    }
+
+    signals = detect_lagging_correlated_markets([laggard], [leader])
+    assert signals
+    assert all(s["relationship"] != "shared_keyword_theme" for s in signals)
 
 
 # ---------------------------------------------------------------------------
@@ -200,16 +306,15 @@ def test_load_leader_markets_from_json_file():
 
 def test_lag_signals_from_external_leader_markets():
     leader = {
-        "title": "Will Fed cut rates in Q3?",
-        "market_key": "fed-cut-q3",
-        "reference_event": "FOMC",
+        "title": "Will Trump win the election?",
+        "market_key": "trump-election",
         "one_hour_price_change": 0.07,
         "one_day_price_change": 0.09,
         "mid": 0.65,
     }
     laggard = {
-        "title": "Will Fed pause rates in Q3?",
-        "market_key": "fed-pause-q3",
+        "title": "Will Republicans control Congress after the election?",
+        "market_key": "congress-election",
         "one_hour_price_change": 0.001,
         "one_day_price_change": 0.002,
         "mid": 0.30,
@@ -223,8 +328,8 @@ def test_lag_signals_from_external_leader_markets():
     Path(tmp_path).unlink()
 
     assert len(signals) == 1
-    assert signals[0]["leader_market_key"] == "fed-cut-q3"
-    assert signals[0]["laggard_market_key"] == "fed-pause-q3"
+    assert signals[0]["leader_market_key"] == "trump-election"
+    assert signals[0]["laggard_market_key"] == "congress-election"
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +376,24 @@ def test_action_is_buy_no_when_leader_move_negative():
     leader["computed_mid_delta"] = -0.05
     signals = detect_lagging_correlated_markets([laggard], [leader])
     assert len(signals) == 1
+    assert signals[0]["action"] == "buy_no_laggard"
+
+
+def test_expected_direction_controls_opposite_action(monkeypatch):
+    leader, laggard = _lag_pair()
+
+    def fake_score(_leader, _laggard):
+        return {
+            "score": 0.8,
+            "relationship": "same_semantic_group",
+            "reasons": ["forced opposite direction for test"],
+            "expected_direction": "opposite",
+        }
+
+    monkeypatch.setattr(intelligence, "score_market_relationship", fake_score)
+    signals = intelligence.detect_lagging_correlated_markets([laggard], [leader])
+    assert len(signals) == 1
+    assert signals[0]["expected_direction"] == "opposite"
     assert signals[0]["action"] == "buy_no_laggard"
 
 

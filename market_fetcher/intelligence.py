@@ -8,14 +8,140 @@ LOGGER = logging.getLogger(__name__)
 _STOPWORDS = {
     "will", "the", "a", "an", "in", "on", "by", "of", "to", "be", "is",
     "before", "after", "when", "how", "what", "who", "this", "that",
-    "for", "with", "yes", "no", "market", "markets",
+    "for", "with", "yes", "no", "market", "markets", "and", "or", "it",
+    "hit", "get", "have", "has", "from", "at", "as", "than", "over",
+}
+
+_GROUP_TERMS = {
+    "crypto": {
+        "bitcoin", "btc", "ethereum", "eth", "solana", "crypto",
+        "microstrategy", "strategy", "mstr",
+    },
+    "geopolitics": {
+        "china", "taiwan", "war", "invasion", "russia", "ukraine",
+        "israel", "iran", "nato",
+    },
+    "politics": {
+        "election", "president", "prime", "minister", "macron", "starmer",
+        "trump", "biden", "congress", "parliament",
+    },
+    "reference_event": {"gta", "gta vi", "gta 6"},
 }
 
 
+def normalize_text(text: str | None) -> str:
+    if not text:
+        return ""
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split())
+
+
+def _text_tokens(text: str | None) -> set[str]:
+    return set(normalize_text(text).split()) - _STOPWORDS
+
+
 def _title_tokens(title: str | None) -> set[str]:
-    if not title:
-        return set()
-    return set(re.sub(r"[^a-z0-9]", " ", title.lower()).split()) - _STOPWORDS
+    return _text_tokens(title)
+
+
+def _market_text(market: dict) -> str:
+    parts = [
+        market.get("title"),
+        market.get("question"),
+        market.get("slug"),
+        market.get("reference_event"),
+    ]
+    return normalize_text(" ".join(str(part) for part in parts if part))
+
+
+def infer_market_group(market: dict) -> str | None:
+    text = _market_text(market)
+    if not text:
+        return None
+
+    for group in ("crypto", "geopolitics", "politics", "reference_event"):
+        for term in _GROUP_TERMS[group]:
+            if re.search(rf"\b{re.escape(term)}\b", text):
+                return group
+    return None
+
+
+def _same_market(leader: dict, laggard: dict) -> bool:
+    leader_key = leader.get("market_key")
+    laggard_key = laggard.get("market_key")
+    if leader_key and laggard_key and str(leader_key) == str(laggard_key):
+        return True
+
+    leader_title = normalize_text(leader.get("title"))
+    laggard_title = normalize_text(laggard.get("title"))
+    return bool(leader_title and laggard_title and leader_title == laggard_title)
+
+
+def _reference_event_label(market: dict) -> str | None:
+    ref = normalize_text(market.get("reference_event"))
+    text = _market_text(market)
+    if ref:
+        return ref
+    if re.search(r"\bgta\s*(vi|6)?\b", text):
+        return "gta vi"
+    return None
+
+
+def score_market_relationship(leader: dict, laggard: dict) -> dict:
+    if _same_market(leader, laggard):
+        return {
+            "score": 0.0,
+            "relationship": "self",
+            "reasons": ["same market_key or normalized title"],
+            "expected_direction": "unknown",
+        }
+
+    score = 0.0
+    reasons: list[str] = []
+    expected_direction = "unknown"
+    leader_ref = _reference_event_label(leader)
+    laggard_ref = _reference_event_label(laggard)
+    same_ref = bool(leader_ref and laggard_ref and leader_ref == laggard_ref)
+
+    if same_ref:
+        score += 0.25
+        reasons.append(f"shared reference_event: {leader_ref}")
+
+    leader_group = infer_market_group(leader)
+    laggard_group = infer_market_group(laggard)
+    same_semantic_group = (
+        bool(leader_group and laggard_group and leader_group == laggard_group)
+        and leader_group != "reference_event"
+    )
+    if same_semantic_group:
+        score += 0.45
+        reasons.append(f"same semantic group: {leader_group}")
+        expected_direction = "same"
+
+    overlap = _title_tokens(leader.get("title")) & _title_tokens(laggard.get("title"))
+    if overlap:
+        keyword_score = min(0.20, len(overlap) * 0.05)
+        score += keyword_score
+        reasons.append("meaningful title keyword overlap: " + ", ".join(sorted(overlap)))
+
+    score = min(1.0, score)
+
+    if same_semantic_group and same_ref:
+        relationship = "same_semantic_group_and_reference_event"
+    elif same_semantic_group:
+        relationship = "same_semantic_group"
+    elif same_ref or (leader_group == laggard_group == "reference_event"):
+        relationship = "reference_event_only"
+        expected_direction = "unknown"
+    else:
+        relationship = "weak_or_unknown"
+
+    return {
+        "score": round(score, 4),
+        "relationship": relationship,
+        "reasons": reasons,
+        "expected_direction": expected_direction,
+    }
+
 
 
 def _best_move(m: dict) -> float | None:
@@ -124,7 +250,7 @@ def detect_inconsistencies(markets):
     return signals
 
 
-def detect_lagging_correlated_markets(
+def _detect_lagging_correlated_markets_legacy(
     markets,
     leader_markets,
     leader_threshold: float = 0.02,
@@ -164,11 +290,11 @@ def detect_lagging_correlated_markets(
             relationship: str | None = None
             laggard_ref = (laggard.get("reference_event") or "").lower()
             if leader_ref and laggard_ref and leader_ref == laggard_ref:
-                relationship = "shared_reference_event"
+                relationship = "legacy_reference_event"
             else:
                 overlap = leader_tokens & _title_tokens(laggard.get("title"))
                 if len(overlap) >= 2:
-                    relationship = "shared_keyword_theme"
+                    relationship = "legacy_keyword_theme"
 
             if relationship is None:
                 LOGGER.debug(
@@ -208,6 +334,110 @@ def detect_lagging_correlated_markets(
                     f"shows no significant price movement ({laggard_move_display:+.3f}). "
                     "This may indicate delayed price discovery or insufficient liquidity "
                     "in the laggard market."
+                ),
+            })
+
+    return signals
+
+
+def detect_lagging_correlated_markets(
+    markets,
+    leader_markets,
+    leader_threshold: float = 0.02,
+    laggard_threshold: float = 0.01,
+    relationship_threshold: float = 0.45,
+):
+    """Flag laggards only when the leader relationship is strong and directional."""
+    signals = []
+
+    for leader in leader_markets:
+        leader_move = _best_move(leader)
+        LOGGER.debug("leader %s | move=%s", leader.get("market_key"), leader_move)
+
+        if leader_move is None or abs(leader_move) < leader_threshold:
+            LOGGER.debug(
+                "  skipped leader below threshold | leader=%s move=%s threshold=%s",
+                leader.get("market_key"), leader_move, leader_threshold,
+            )
+            continue
+
+        for laggard in markets:
+            relationship_score = score_market_relationship(leader, laggard)
+            if relationship_score["relationship"] == "self":
+                LOGGER.debug(
+                    "  skipped self | leader=%s laggard=%s",
+                    leader.get("market_key"), laggard.get("market_key"),
+                )
+                continue
+
+            laggard_move = _best_move(laggard)
+            if laggard_move is not None and abs(laggard_move) > laggard_threshold:
+                LOGGER.debug(
+                    "  skipped laggard already moved | laggard=%s move=%s threshold=%s",
+                    laggard.get("market_key"), laggard_move, laggard_threshold,
+                )
+                continue
+
+            if relationship_score["score"] < relationship_threshold:
+                LOGGER.debug(
+                    "  skipped weak relationship score | laggard=%s score=%s threshold=%s relationship=%s",
+                    laggard.get("market_key"),
+                    relationship_score["score"],
+                    relationship_threshold,
+                    relationship_score["relationship"],
+                )
+                continue
+
+            expected_direction = relationship_score["expected_direction"]
+            if expected_direction == "unknown":
+                LOGGER.debug(
+                    "  skipped unknown expected direction | laggard=%s relationship=%s reasons=%s",
+                    laggard.get("market_key"),
+                    relationship_score["relationship"],
+                    relationship_score["reasons"],
+                )
+                continue
+
+            signal_strength = (
+                abs(leader_move) - abs(laggard_move or 0.0)
+            ) * relationship_score["score"]
+            if laggard.get("spread") is not None and laggard["spread"] <= 0.05:
+                signal_strength += 0.05
+            if laggard.get("depth_top5") is not None and laggard["depth_top5"] >= 10_000:
+                signal_strength += 0.05
+
+            if expected_direction == "same":
+                action = "buy_yes_laggard" if leader_move > 0 else "buy_no_laggard"
+            else:
+                action = "buy_no_laggard" if leader_move > 0 else "buy_yes_laggard"
+            laggard_move_display = laggard_move if laggard_move is not None else 0.0
+
+            LOGGER.debug(
+                "  signal emitted | laggard=%s strength=%.4f action=%s relationship=%s score=%s",
+                laggard.get("market_key"), signal_strength, action,
+                relationship_score["relationship"], relationship_score["score"],
+            )
+
+            signals.append({
+                "type": "lagging_correlated_market",
+                "leader_market_key": leader.get("market_key"),
+                "laggard_market_key": laggard.get("market_key"),
+                "leader_title": leader.get("title"),
+                "laggard_title": laggard.get("title"),
+                "leader_move": leader_move,
+                "laggard_move": laggard_move,
+                "signal_strength": round(signal_strength, 4),
+                "action": action,
+                "relationship": relationship_score["relationship"],
+                "relationship_score": relationship_score["score"],
+                "relationship_reasons": relationship_score["reasons"],
+                "expected_direction": expected_direction,
+                "reason": (
+                    f"Leader market moved {leader_move:+.3f} while related laggard "
+                    f"shows no significant price movement ({laggard_move_display:+.3f}). "
+                    f"Relationship '{relationship_score['relationship']}' scored "
+                    f"{relationship_score['score']:.2f}, suggesting delayed price "
+                    "discovery may be tradable in the laggard market."
                 ),
             })
 
