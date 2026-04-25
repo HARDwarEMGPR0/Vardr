@@ -93,5 +93,39 @@ class FetchSnapshotTests(unittest.TestCase):
         self.assertGreaterEqual(len(matched), 1)
 
 
+    def _fixture_payload(self) -> dict:
+        args = argparse.Namespace(
+            mode="fixture",
+            fixtures_dir=str(ROOT / "fixtures"),
+            poly_limit=200,
+            kalshi_limit=200,
+            n_markets=5,
+            n_kalshi=5,
+            n_polymarket=5,
+            include_mve=False,
+            mapping=None,
+            save_fixtures=False,
+            allow_fallback=False,
+        )
+        return run_pipeline(args)
+
+    def test_d_intelligence_block_has_all_keys(self) -> None:
+        intel = self._fixture_payload()["intelligence"]
+        self.assertIn("opportunities", intel)
+        self.assertIn("reference_event_clusters", intel)
+        self.assertIn("inconsistencies", intel)
+        self.assertIn("lag_signals", intel)
+        self.assertIsInstance(intel["opportunities"], list)
+        self.assertIsInstance(intel["reference_event_clusters"], list)
+        self.assertIsInstance(intel["inconsistencies"], list)
+        self.assertIsInstance(intel["lag_signals"], list)
+
+    def test_e_stale_reason_text_absent(self) -> None:
+        import json
+        payload_str = json.dumps(self._fixture_payload())
+        self.assertNotIn("Unrelated events priced similarly", payload_str)
+        self.assertNotIn("narrative distortion", payload_str)
+
+
 if __name__ == "__main__":
     unittest.main()

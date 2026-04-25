@@ -17,6 +17,14 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from market_fetcher.intelligence import (
+    find_opportunities,
+    detect_inconsistencies,
+    detect_reference_event_clusters,
+    detect_lagging_correlated_markets,
+)
+
+
 from src.connectors.kalshi_public import fetch_markets as fetch_kalshi_markets  # noqa: E402
 from src.connectors.polymarket_gamma import fetch_markets as fetch_polymarket_markets  # noqa: E402
 from src.normalize import normalize_kalshi_market, normalize_polymarket_market, utc_now_iso  # noqa: E402
@@ -359,6 +367,14 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 divergence_by_key[k_key] = d
                 divergence_by_key[p_key] = d
 
+    opportunities = find_opportunities(polymarket_snapshots)
+    reference_event_clusters = detect_reference_event_clusters(polymarket_snapshots)
+    inconsistencies = detect_inconsistencies(polymarket_snapshots)
+    lag_signals = detect_lagging_correlated_markets(
+        markets=polymarket_snapshots,
+        leader_markets=polymarket_snapshots,
+    )
+
     poly_scores = []
     for snap in polymarket_snapshots:
         risk = execution_risk_index(snap, divergence_stress=divergence_by_key.get(str(snap.get("market_key")), 0.0))
@@ -406,6 +422,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "kalshi_markets": kalshi_scores,
             "kalshi": kalshi_scores[0] if kalshi_scores else None,
             "divergence": [{"market_key": k, "divergence": v} for k, v in divergence_by_key.items()],
+        },
+        "intelligence": {
+            "opportunities": opportunities,
+            "reference_event_clusters": reference_event_clusters,
+            "inconsistencies": inconsistencies,
+            "lag_signals": lag_signals,
         },
     }
     return payload
