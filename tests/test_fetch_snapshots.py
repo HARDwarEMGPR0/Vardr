@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -93,8 +95,8 @@ class FetchSnapshotTests(unittest.TestCase):
         self.assertGreaterEqual(len(matched), 1)
 
 
-    def _fixture_payload(self) -> dict:
-        args = argparse.Namespace(
+    def _fixture_args(self, **overrides) -> argparse.Namespace:
+        base = dict(
             mode="fixture",
             fixtures_dir=str(ROOT / "fixtures"),
             poly_limit=200,
@@ -106,7 +108,16 @@ class FetchSnapshotTests(unittest.TestCase):
             mapping=None,
             save_fixtures=False,
             allow_fallback=False,
+            leader_markets_json=None,
+            history_jsonl=None,
+            debug_intelligence=False,
+            summary=False,
         )
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def _fixture_payload(self) -> dict:
+        args = self._fixture_args()
         return run_pipeline(args)
 
     def test_d_intelligence_block_has_all_keys(self) -> None:
@@ -119,6 +130,97 @@ class FetchSnapshotTests(unittest.TestCase):
         self.assertIsInstance(intel["reference_event_clusters"], list)
         self.assertIsInstance(intel["inconsistencies"], list)
         self.assertIsInstance(intel["lag_signals"], list)
+
+    def test_f_pipeline_accepts_leader_markets_json(self) -> None:
+        leader = {
+            "title": "Will Bitcoin hit 100k before GTA VI?",
+            "market_key": "btc-100k-leader",
+            "reference_event": None,
+            "one_hour_price_change": 0.06,
+            "one_day_price_change": 0.10,
+            "mid": 0.70,
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        ) as f:
+            json.dump([leader], f)
+            tmp_path = f.name
+
+        try:
+            payload = run_pipeline(self._fixture_args(leader_markets_json=tmp_path))
+        finally:
+            Path(tmp_path).unlink()
+
+        intel = payload["intelligence"]
+        self.assertIn("lag_signals", intel)
+        self.assertIsInstance(intel["lag_signals"], list)
+
+    def test_g_history_jsonl_writes_one_line(self) -> None:
+        from scripts.fetch_snapshots import _append_run_to_jsonl
+
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            tmp = f.name
+        Path(tmp).unlink()
+        try:
+            _append_run_to_jsonl(tmp, {"run_id": "r1"})
+            lines = [l for l in Path(tmp).read_text(encoding="utf-8").splitlines() if l.strip()]
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(json.loads(lines[0])["run_id"], "r1")
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+
+    def test_h_history_jsonl_appends_not_overwrites(self) -> None:
+        from scripts.fetch_snapshots import _append_run_to_jsonl
+
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            tmp = f.name
+        Path(tmp).unlink()
+        try:
+            _append_run_to_jsonl(tmp, {"run_id": "first"})
+            _append_run_to_jsonl(tmp, {"run_id": "second"})
+            lines = [l for l in Path(tmp).read_text(encoding="utf-8").splitlines() if l.strip()]
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(json.loads(lines[0])["run_id"], "first")
+            self.assertEqual(json.loads(lines[1])["run_id"], "second")
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+
+    def test_i_computed_mid_delta_present_with_prior_snapshot(self) -> None:
+        # First run: build a payload to act as the "previous" snapshot
+        first_payload = self._fixture_payload()
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+        ) as f:
+            json.dump(first_payload, f)
+            f.write("\n")
+            tmp = f.name
+
+        try:
+            second_payload = run_pipeline(self._fixture_args(history_jsonl=tmp))
+            for snap in second_payload["polymarket_snapshots"]:
+                self.assertIn("computed_mid_delta", snap)
+            # Same fixture data → deltas are 0.0 for matching markets (not None)
+            non_none = [
+                s["computed_mid_delta"]
+                for s in second_payload["polymarket_snapshots"]
+                if s["computed_mid_delta"] is not None
+            ]
+            self.assertGreater(len(non_none), 0)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+
+    def test_j_summary_helper_includes_intelligence_summary(self) -> None:
+        import io
+        from scripts.fetch_snapshots import _print_intelligence_summary
+
+        payload = self._fixture_payload()
+        buf = io.StringIO()
+        _print_intelligence_summary(payload, file=buf)
+        output = buf.getvalue()
+        self.assertIn("INTELLIGENCE SUMMARY", output)
+        self.assertIn("Opportunities", output)
+        self.assertIn("Lag signals", output)
 
     def test_e_stale_reason_text_absent(self) -> None:
         import json

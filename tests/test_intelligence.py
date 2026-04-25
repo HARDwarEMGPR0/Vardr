@@ -1,9 +1,14 @@
+import json
+import tempfile
+from pathlib import Path
+
 from market_fetcher.intelligence import (
     find_opportunities,
     detect_inconsistencies,
     detect_reference_event_clusters,
     detect_lagging_correlated_markets,
 )
+from market_fetcher.leader_markets import load_leader_markets
 
 
 def _market(title, spread, depth_top5, mid, market_key="key-1"):
@@ -162,3 +167,144 @@ def test_detect_lagging_correlated_markets_flags_laggard():
     assert s["laggard_market_key"] == "btc-etf"
     assert s["relationship"] == "shared_keyword_theme"
     assert "reason" in s
+
+
+# ---------------------------------------------------------------------------
+# load_leader_markets
+# ---------------------------------------------------------------------------
+
+def test_load_leader_markets_none_returns_empty():
+    assert load_leader_markets(None) == []
+
+
+def test_load_leader_markets_from_json_file():
+    leaders = [
+        {
+            "title": "Will Fed cut rates in Q3?",
+            "market_key": "fed-cut-q3",
+            "reference_event": "FOMC",
+            "one_hour_price_change": 0.05,
+            "one_day_price_change": 0.08,
+            "mid": 0.65,
+        }
+    ]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(leaders, f)
+        tmp_path = f.name
+
+    loaded = load_leader_markets(tmp_path)
+    assert loaded == leaders
+    assert loaded[0]["market_key"] == "fed-cut-q3"
+    Path(tmp_path).unlink()
+
+
+def test_lag_signals_from_external_leader_markets():
+    leader = {
+        "title": "Will Fed cut rates in Q3?",
+        "market_key": "fed-cut-q3",
+        "reference_event": "FOMC",
+        "one_hour_price_change": 0.07,
+        "one_day_price_change": 0.09,
+        "mid": 0.65,
+    }
+    laggard = {
+        "title": "Will Fed pause rates in Q3?",
+        "market_key": "fed-pause-q3",
+        "one_hour_price_change": 0.001,
+        "one_day_price_change": 0.002,
+        "mid": 0.30,
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump([leader], f)
+        tmp_path = f.name
+
+    loaded_leaders = load_leader_markets(tmp_path)
+    signals = detect_lagging_correlated_markets(markets=[laggard], leader_markets=loaded_leaders)
+    Path(tmp_path).unlink()
+
+    assert len(signals) == 1
+    assert signals[0]["leader_market_key"] == "fed-cut-q3"
+    assert signals[0]["laggard_market_key"] == "fed-pause-q3"
+
+
+# ---------------------------------------------------------------------------
+# detect_lagging_correlated_markets — new signal fields
+# ---------------------------------------------------------------------------
+
+def _lag_pair():
+    """Return a (leader, laggard) pair that always produces a signal."""
+    leader = {
+        "title": "Will Bitcoin ETF hit record high?",
+        "market_key": "btc-leader",
+        "mid": 0.70,
+        "computed_mid_delta": 0.05,
+        "one_hour_price_change": 0.03,
+    }
+    laggard = {
+        "title": "Will Bitcoin ETF get approval?",
+        "market_key": "btc-laggard",
+        "mid": 0.50,
+        "computed_mid_delta": 0.001,
+        "spread": 0.02,
+        "depth_top5": 20_000,
+    }
+    return leader, laggard
+
+
+def test_lag_uses_computed_mid_delta_before_1h_change():
+    leader, laggard = _lag_pair()
+    signals = detect_lagging_correlated_markets([laggard], [leader])
+    assert len(signals) == 1
+    # leader_move should be the delta (0.05), not 1h change (0.03)
+    assert signals[0]["leader_move"] == 0.05
+
+
+def test_action_is_buy_yes_when_leader_move_positive():
+    leader, laggard = _lag_pair()
+    signals = detect_lagging_correlated_markets([laggard], [leader])
+    assert len(signals) == 1
+    assert signals[0]["action"] == "buy_yes_laggard"
+
+
+def test_action_is_buy_no_when_leader_move_negative():
+    leader, laggard = _lag_pair()
+    leader["computed_mid_delta"] = -0.05
+    signals = detect_lagging_correlated_markets([laggard], [leader])
+    assert len(signals) == 1
+    assert signals[0]["action"] == "buy_no_laggard"
+
+
+def test_signal_strength_is_numeric():
+    leader, laggard = _lag_pair()
+    signals = detect_lagging_correlated_markets([laggard], [leader])
+    assert len(signals) == 1
+    strength = signals[0]["signal_strength"]
+    assert isinstance(strength, (int, float))
+    assert strength > 0
+
+
+def test_debug_output_goes_to_stderr_not_stdout():
+    import io
+    import logging
+
+    logger = logging.getLogger("market_fetcher.intelligence")
+    capture = io.StringIO()
+    handler = logging.StreamHandler(capture)
+    handler.setLevel(logging.DEBUG)
+    old_level = logger.level
+    old_handlers = logger.handlers[:]
+    old_propagate = logger.propagate
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    logger.propagate = False
+
+    try:
+        leader, laggard = _lag_pair()
+        signals = detect_lagging_correlated_markets([laggard], [leader])
+        debug_text = capture.getvalue()
+        assert debug_text, "expected debug output when logger is at DEBUG"
+        assert len(signals) == 1, "function must still produce correct signals"
+    finally:
+        logger.setLevel(old_level)
+        logger.handlers = old_handlers
+        logger.propagate = old_propagate

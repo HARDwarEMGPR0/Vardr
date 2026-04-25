@@ -17,12 +17,14 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from market_fetcher.history import load_latest_previous_snapshot, compute_market_deltas
 from market_fetcher.intelligence import (
     find_opportunities,
     detect_inconsistencies,
     detect_reference_event_clusters,
     detect_lagging_correlated_markets,
 )
+from market_fetcher.leader_markets import load_leader_markets
 
 
 from src.connectors.kalshi_public import fetch_markets as fetch_kalshi_markets  # noqa: E402
@@ -90,6 +92,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-mve", action="store_true", help="Include KXMVESPORTSMULTIGAMEEXTENDED markets")
     parser.add_argument("--mapping", type=str, default=None)
     parser.add_argument("--save-fixtures", action="store_true")
+    parser.add_argument("--leader-markets-json", type=str, default=None, dest="leader_markets_json")
+    parser.add_argument("--history-jsonl", type=str, default=None, dest="history_jsonl")
+    parser.add_argument("--debug-intelligence", action="store_true", dest="debug_intelligence")
+    parser.add_argument("--summary", action="store_true")
 
     def _parse_bool(value: str | None) -> bool:
         if value is None:
@@ -136,6 +142,13 @@ def _load_mapping(path: str | None) -> tuple[list[tuple[str, str]], str | None]:
         if k and p:
             out.append((str(k), str(p)))
     return out, None
+
+
+def _append_run_to_jsonl(path: str | Path, record: dict[str, Any]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
 
 
 def _append_run_to_file(record: dict[str, Any]) -> None:
@@ -309,6 +322,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     )
     polymarket_snapshots = [normalize_polymarket_market(market, ts_utc=ts) for market in poly_markets]
 
+    history_path = getattr(args, "history_jsonl", None)
+    previous_payload = load_latest_previous_snapshot(history_path)
+    polymarket_snapshots = compute_market_deltas(polymarket_snapshots, previous_payload)
+
     kalshi_markets, kalshi_source, kalshi_error, kalshi_debug = fetch_kalshi_markets(
         mode=args.mode,
         allow_fallback=allow_fallback,
@@ -370,9 +387,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     opportunities = find_opportunities(polymarket_snapshots)
     reference_event_clusters = detect_reference_event_clusters(polymarket_snapshots)
     inconsistencies = detect_inconsistencies(polymarket_snapshots)
+    loaded_leaders = load_leader_markets(getattr(args, "leader_markets_json", None))
     lag_signals = detect_lagging_correlated_markets(
         markets=polymarket_snapshots,
-        leader_markets=polymarket_snapshots,
+        leader_markets=loaded_leaders if loaded_leaders else polymarket_snapshots,
     )
 
     poly_scores = []
@@ -442,9 +460,44 @@ def determine_exit_code(payload: dict[str, Any], mode: str) -> int:
     return 0 if (ok_poly or ok_kalshi) else 1
 
 
+def _enable_debug_intelligence() -> None:
+    intel_logger = logging.getLogger("market_fetcher.intelligence")
+    intel_logger.setLevel(logging.DEBUG)
+    if not intel_logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setLevel(logging.DEBUG)
+        intel_logger.addHandler(handler)
+        intel_logger.propagate = False
+
+
+def _print_intelligence_summary(payload: dict[str, Any], file: Any = None) -> None:
+    if file is None:
+        file = sys.stderr
+    intel = payload.get("intelligence", {})
+    lag = intel.get("lag_signals", [])
+    lag_sorted = sorted(lag, key=lambda s: s.get("signal_strength", 0.0), reverse=True)
+    print("\nINTELLIGENCE SUMMARY", file=file)
+    print(f"  Opportunities:            {len(intel.get('opportunities', []))}", file=file)
+    print(f"  Reference-event clusters: {len(intel.get('reference_event_clusters', []))}", file=file)
+    print(f"  Lag signals:              {len(lag)}", file=file)
+    if lag_sorted:
+        print("  Top lag signals (by signal_strength):", file=file)
+        for s in lag_sorted[:5]:
+            leader = (s.get("leader_title") or "?")[:40]
+            laggard = (s.get("laggard_title") or "?")[:40]
+            print(
+                f"    [{s.get('signal_strength', 0.0):.3f}] {s.get('action', '?')}"
+                f" | leader: {leader} → laggard: {laggard}",
+                file=file,
+            )
+
+
 def main() -> int:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+    if getattr(args, "debug_intelligence", False):
+        _enable_debug_intelligence()
 
     try:
         payload = run_pipeline(args)
@@ -479,11 +532,18 @@ def main() -> int:
     print(json.dumps(payload, indent=2))
     _append_run_to_file(payload)
 
+    history_path = getattr(args, "history_jsonl", None)
+    if history_path:
+        _append_run_to_jsonl(history_path, payload)
+
     poly_dbg = payload.get("selection_debug", {}).get("polymarket", {})
     kalshi_dbg = payload.get("selection_debug", {}).get("kalshi", {})
     print("SELECTION SUMMARY", file=sys.stderr)
     print(f"  Polymarket: {_selection_summary_block(poly_dbg)}", file=sys.stderr)
     print(f"  Kalshi: {_selection_summary_block(kalshi_dbg)}", file=sys.stderr)
+
+    if getattr(args, "summary", False):
+        _print_intelligence_summary(payload)
 
     return exit_code
 
