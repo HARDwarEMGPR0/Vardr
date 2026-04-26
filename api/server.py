@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import hashlib
+import re
 import traceback
 import time
 import uuid
@@ -19,6 +21,43 @@ from src.market_resolver import TradeIntent, resolve_trade_detailed
 LOGGER = logging.getLogger(__name__)
 
 app = FastAPI(title="True Markets Resolver API", version="1.0.0")
+
+LEADER_MARKET_FIELDS = (
+    "title",
+    "market_key",
+    "reference_event",
+    "mid",
+    "computed_mid_delta",
+    "one_hour_price_change",
+    "one_day_price_change",
+    "source",
+    "reason",
+)
+
+DEMO_LEADER_MARKETS = [
+    {
+        "title": "Will bitcoin hit $1m before GTA VI?",
+        "market_key": "vardr_btc_leader_1",
+        "reference_event": "GTA VI",
+        "mid": 0.56,
+        "computed_mid_delta": 0.05,
+        "one_hour_price_change": 0.05,
+        "one_day_price_change": 0.08,
+        "source": "vardr",
+        "reason": "Demo leader market showing a meaningful positive move.",
+    },
+    {
+        "title": "Will Ethereum ETF volume rise this week?",
+        "market_key": "vardr_eth_leader_low_move",
+        "reference_event": None,
+        "mid": 0.49,
+        "computed_mid_delta": 0.01,
+        "one_hour_price_change": 0.01,
+        "one_day_price_change": 0.015,
+        "source": "vardr",
+        "reason": "Demo low-move leader used to exercise filtering.",
+    },
+]
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,6 +99,52 @@ class ResolveErrorResponse(BaseModel):
     venue_status: dict | None = None
 
 
+def _normalize_text(text: str | None) -> str:
+    if not text:
+        return ""
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text.lower()).split())
+
+
+def _fallback_market_key(title: str) -> str:
+    normalized = _normalize_text(title)
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+    return f"vardr_{digest}"
+
+
+def _best_leader_move(market: dict) -> float | None:
+    for field in ("computed_mid_delta", "one_hour_price_change", "one_day_price_change"):
+        value = market.get(field)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def normalize_leader_market(raw: dict) -> dict:
+    title = raw.get("title") or raw.get("question")
+    if not title:
+        return {}
+
+    normalized = {
+        "title": str(title),
+        "market_key": raw.get("market_key") or raw.get("id") or raw.get("ticker") or raw.get("slug"),
+        "reference_event": raw.get("reference_event"),
+        "mid": raw.get("mid"),
+        "computed_mid_delta": raw.get("computed_mid_delta"),
+        "one_hour_price_change": raw.get("one_hour_price_change"),
+        "one_day_price_change": raw.get("one_day_price_change"),
+        "source": raw.get("source") or "vardr",
+        "reason": raw.get("reason"),
+    }
+    if not normalized["market_key"]:
+        normalized["market_key"] = _fallback_market_key(normalized["title"])
+    return normalized
+
+
+def get_leader_markets() -> list[dict]:
+    normalized = [normalize_leader_market(market) for market in DEMO_LEADER_MARKETS]
+    return [market for market in normalized if market]
+
+
 def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
     expected = os.getenv("TRUE_MARKETS_API_KEY")
     if not expected:
@@ -71,6 +156,22 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
 @app.get("/health")
 def health() -> dict[str, bool]:
     return {"ok": True}
+
+
+@app.get("/leader-markets")
+def leader_markets(
+    limit: int = Query(default=10, ge=1),
+    min_abs_move: float = Query(default=0.02, ge=0.0),
+) -> list[dict]:
+    leaders = []
+    for market in get_leader_markets():
+        move = _best_leader_move(market)
+        if move is None or abs(move) < min_abs_move:
+            continue
+        leaders.append({field: market.get(field) for field in LEADER_MARKET_FIELDS})
+        if len(leaders) >= limit:
+            break
+    return leaders
 
 
 @app.post("/resolve_market")

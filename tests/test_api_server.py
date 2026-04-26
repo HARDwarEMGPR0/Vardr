@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+import api.server as api_server
 import src.market_resolver as resolver_module
 from api.server import app
 
@@ -13,6 +14,72 @@ def test_health_ok() -> None:
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
+
+
+def test_leader_markets_returns_list_with_required_keys() -> None:
+    resp = client.get("/leader-markets")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert isinstance(payload, list)
+    assert payload
+    required = {
+        "title",
+        "market_key",
+        "reference_event",
+        "mid",
+        "computed_mid_delta",
+        "one_hour_price_change",
+        "one_day_price_change",
+        "source",
+        "reason",
+    }
+    assert required.issubset(payload[0])
+
+
+def test_leader_markets_limit_parameter_works() -> None:
+    resp = client.get("/leader-markets?limit=1&min_abs_move=0")
+
+    assert resp.status_code == 200
+    assert len(resp.json()) == 1
+
+
+def test_leader_markets_min_abs_move_filters_low_move_leaders() -> None:
+    resp = client.get("/leader-markets?min_abs_move=0.06")
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_leader_markets_fallback_demo_leader_appears() -> None:
+    resp = client.get("/leader-markets")
+
+    assert resp.status_code == 200
+    titles = {item["title"] for item in resp.json()}
+    assert "Will bitcoin hit $1m before GTA VI?" in titles
+
+
+def test_leader_markets_creates_fallback_key_and_skips_missing_title(monkeypatch) -> None:
+    monkeypatch.setattr(
+        api_server,
+        "get_leader_markets",
+        lambda: [
+            api_server.normalize_leader_market({
+                "title": "Fallback key market",
+                "computed_mid_delta": 0.03,
+            }),
+            api_server.normalize_leader_market({
+                "computed_mid_delta": 0.03,
+            }),
+        ],
+    )
+
+    resp = client.get("/leader-markets")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert len(payload) == 1
+    assert payload[0]["market_key"].startswith("vardr_")
 
 
 def test_resolve_market_accepts_side_case_insensitive() -> None:
