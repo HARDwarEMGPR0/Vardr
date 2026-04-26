@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.fetch_snapshots import build_cross_venue, run_pipeline
 from src.connectors.kalshi_public import fetch_markets_fixture as fetch_kalshi_fixture
@@ -109,6 +110,7 @@ class FetchSnapshotTests(unittest.TestCase):
             save_fixtures=False,
             allow_fallback=False,
             leader_markets_json=None,
+            vardr_leader_api_url=None,
             history_jsonl=None,
             debug_intelligence=False,
             summary=False,
@@ -126,10 +128,12 @@ class FetchSnapshotTests(unittest.TestCase):
         self.assertIn("reference_event_clusters", intel)
         self.assertIn("inconsistencies", intel)
         self.assertIn("lag_signals", intel)
+        self.assertIn("review_candidates", intel)
         self.assertIsInstance(intel["opportunities"], list)
         self.assertIsInstance(intel["reference_event_clusters"], list)
         self.assertIsInstance(intel["inconsistencies"], list)
         self.assertIsInstance(intel["lag_signals"], list)
+        self.assertIsInstance(intel["review_candidates"], list)
 
     def test_f_pipeline_accepts_leader_markets_json(self) -> None:
         leader = {
@@ -154,6 +158,21 @@ class FetchSnapshotTests(unittest.TestCase):
         intel = payload["intelligence"]
         self.assertIn("lag_signals", intel)
         self.assertIsInstance(intel["lag_signals"], list)
+
+    def test_f_pipeline_accepts_vardr_leader_api_url(self) -> None:
+        leader = {
+            "title": "Will Bitcoin hit 100k before GTA VI?",
+            "market_key": "btc-api-leader",
+            "one_hour_price_change": 0.06,
+        }
+        with patch("scripts.fetch_snapshots.load_leader_markets_from_vardr_api", return_value=[leader]) as loader:
+            payload = run_pipeline(
+                self._fixture_args(vardr_leader_api_url="http://localhost:8000/leader-markets")
+            )
+
+        loader.assert_called_once_with("http://localhost:8000/leader-markets")
+        self.assertIn("lag_signals", payload["intelligence"])
+        self.assertIn("review_candidates", payload["intelligence"])
 
     def test_g_history_jsonl_writes_one_line(self) -> None:
         from scripts.fetch_snapshots import _append_run_to_jsonl
@@ -221,6 +240,7 @@ class FetchSnapshotTests(unittest.TestCase):
         self.assertIn("INTELLIGENCE SUMMARY", output)
         self.assertIn("Opportunities", output)
         self.assertIn("Lag signals", output)
+        self.assertIn("Review candidates", output)
 
     def test_e_stale_reason_text_absent(self) -> None:
         import json

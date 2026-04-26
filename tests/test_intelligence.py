@@ -8,9 +8,10 @@ from market_fetcher.intelligence import (
     detect_inconsistencies,
     detect_reference_event_clusters,
     detect_lagging_correlated_markets,
+    detect_lagging_correlated_markets_with_review,
     score_market_relationship,
 )
-from market_fetcher.leader_markets import load_leader_markets
+from market_fetcher.leader_markets import load_leader_markets, load_leader_markets_from_vardr_api
 
 
 def _market(title, spread, depth_top5, mid, market_key="key-1"):
@@ -258,6 +259,46 @@ def test_crypto_leader_does_not_emit_for_geopolitics_laggard_with_same_gta_refer
     assert detect_lagging_correlated_markets([laggard], [leader]) == []
 
 
+def test_btc_up_microstrategy_sells_bitcoin_becomes_review_candidate():
+    leader = {
+        "title": "Will Bitcoin hit $1m before GTA VI?",
+        "market_key": "btc-leader",
+        "computed_mid_delta": 0.05,
+    }
+    laggard = {
+        "title": "MicroStrategy sells any Bitcoin by June 30, 2026?",
+        "market_key": "mstr-sells-btc",
+        "computed_mid_delta": 0.0,
+        "spread": 0.002,
+        "depth_top5": 60_000,
+    }
+
+    result = detect_lagging_correlated_markets_with_review([laggard], [leader])
+    assert result["lag_signals"] == []
+    assert len(result["review_candidates"]) == 1
+    assert "does not clearly imply" in result["review_candidates"][0]["reason"]
+
+
+def test_reference_event_only_pair_becomes_review_candidate_not_lag_signal():
+    leader = {
+        "title": "Will Bitcoin rally before GTA VI?",
+        "market_key": "btc-gta",
+        "reference_event": "GTA VI",
+        "computed_mid_delta": 0.05,
+    }
+    laggard = {
+        "title": "Will China invade Taiwan before GTA VI?",
+        "market_key": "china-taiwan-gta",
+        "reference_event": "GTA VI",
+        "computed_mid_delta": 0.0,
+    }
+
+    result = detect_lagging_correlated_markets_with_review([laggard], [leader])
+    assert result["lag_signals"] == []
+    assert len(result["review_candidates"]) == 1
+    assert result["review_candidates"][0]["relationship"] == "reference_event_only"
+
+
 def test_no_emitted_signal_uses_shared_keyword_theme_relationship():
     leader = {
         "title": "Will Bitcoin ETF hit record high?",
@@ -302,6 +343,69 @@ def test_load_leader_markets_from_json_file():
     assert loaded == leaders
     assert loaded[0]["market_key"] == "fed-cut-q3"
     Path(tmp_path).unlink()
+
+
+def test_vardr_api_loader_accepts_list_response(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {
+                    "title": "Will Bitcoin rally?",
+                    "market_key": "btc-rally",
+                    "one_hour_price_change": 0.06,
+                }
+            ]
+
+    monkeypatch.setattr("market_fetcher.leader_markets.requests.get", lambda *args, **kwargs: Response())
+    loaded = load_leader_markets_from_vardr_api("http://localhost:8000/leader-markets")
+    assert loaded == [
+        {
+            "title": "Will Bitcoin rally?",
+            "market_key": "btc-rally",
+            "reference_event": None,
+            "mid": None,
+            "computed_mid_delta": None,
+            "one_hour_price_change": 0.06,
+            "one_day_price_change": None,
+            "source": "vardr_api",
+        }
+    ]
+
+
+def test_vardr_api_loader_accepts_dict_leader_markets_response(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "leader_markets": [
+                    {
+                        "question": "Will Trump win the election?",
+                        "id": "trump-election",
+                        "mid": 0.52,
+                    }
+                ]
+            }
+
+    monkeypatch.setattr("market_fetcher.leader_markets.requests.get", lambda *args, **kwargs: Response())
+    loaded = load_leader_markets_from_vardr_api("http://localhost:8000/leader-markets")
+    assert loaded[0]["title"] == "Will Trump win the election?"
+    assert loaded[0]["market_key"] == "trump-election"
+    assert loaded[0]["mid"] == 0.52
+
+
+def test_vardr_api_loader_handles_failures_safely(monkeypatch):
+    import requests
+
+    def fail(*args, **kwargs):
+        raise requests.ConnectionError("offline")
+
+    monkeypatch.setattr("market_fetcher.leader_markets.requests.get", fail)
+    assert load_leader_markets_from_vardr_api("http://localhost:8000/leader-markets") == []
 
 
 def test_lag_signals_from_external_leader_markets():

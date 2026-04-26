@@ -22,9 +22,9 @@ from market_fetcher.intelligence import (
     find_opportunities,
     detect_inconsistencies,
     detect_reference_event_clusters,
-    detect_lagging_correlated_markets,
+    detect_lagging_correlated_markets_with_review,
 )
-from market_fetcher.leader_markets import load_leader_markets
+from market_fetcher.leader_markets import load_leader_markets, load_leader_markets_from_vardr_api
 
 
 from src.connectors.kalshi_public import fetch_markets as fetch_kalshi_markets  # noqa: E402
@@ -93,6 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mapping", type=str, default=None)
     parser.add_argument("--save-fixtures", action="store_true")
     parser.add_argument("--leader-markets-json", type=str, default=None, dest="leader_markets_json")
+    parser.add_argument("--vardr-leader-api-url", type=str, default=None, dest="vardr_leader_api_url")
     parser.add_argument("--history-jsonl", type=str, default=None, dest="history_jsonl")
     parser.add_argument("--debug-intelligence", action="store_true", dest="debug_intelligence")
     parser.add_argument("--summary", action="store_true")
@@ -387,11 +388,25 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     opportunities = find_opportunities(polymarket_snapshots)
     reference_event_clusters = detect_reference_event_clusters(polymarket_snapshots)
     inconsistencies = detect_inconsistencies(polymarket_snapshots)
-    loaded_leaders = load_leader_markets(getattr(args, "leader_markets_json", None))
-    lag_signals = detect_lagging_correlated_markets(
+    leader_error = None
+    loaded_leaders = []
+    vardr_leader_api_url = getattr(args, "vardr_leader_api_url", None)
+    leader_markets_json = getattr(args, "leader_markets_json", None)
+    try:
+        if vardr_leader_api_url:
+            loaded_leaders = load_leader_markets_from_vardr_api(vardr_leader_api_url)
+        elif leader_markets_json:
+            loaded_leaders = load_leader_markets(leader_markets_json)
+    except Exception as exc:
+        leader_error = f"leader_markets_error: {exc}"
+        loaded_leaders = []
+
+    lag_review = detect_lagging_correlated_markets_with_review(
         markets=polymarket_snapshots,
         leader_markets=loaded_leaders if loaded_leaders else polymarket_snapshots,
     )
+    lag_signals = lag_review["lag_signals"]
+    review_candidates = lag_review["review_candidates"]
 
     poly_scores = []
     for snap in polymarket_snapshots:
@@ -415,6 +430,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         errors.append({"venue": "kalshi", "error": kalshi_error})
     if mapping_error:
         errors.append({"venue": "mapping", "error": mapping_error})
+    if leader_error:
+        errors.append({"venue": "leader_markets", "error": leader_error})
 
     payload = {
         "run_id": run_id,
@@ -446,6 +463,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "reference_event_clusters": reference_event_clusters,
             "inconsistencies": inconsistencies,
             "lag_signals": lag_signals,
+            "review_candidates": review_candidates,
         },
     }
     return payload
@@ -470,7 +488,7 @@ def _enable_debug_intelligence() -> None:
         intel_logger.propagate = False
 
 
-def _print_intelligence_summary(payload: dict[str, Any], file: Any = None) -> None:
+def _print_intelligence_summary_legacy(payload: dict[str, Any], file: Any = None) -> None:
     if file is None:
         file = sys.stderr
     intel = payload.get("intelligence", {})
@@ -488,6 +506,41 @@ def _print_intelligence_summary(payload: dict[str, Any], file: Any = None) -> No
             print(
                 f"    [{s.get('signal_strength', 0.0):.3f}] {s.get('action', '?')}"
                 f" | leader: {leader} → laggard: {laggard}",
+                file=file,
+            )
+
+
+def _print_intelligence_summary(payload: dict[str, Any], file: Any = None) -> None:
+    if file is None:
+        file = sys.stderr
+    intel = payload.get("intelligence", {})
+    lag = intel.get("lag_signals", [])
+    review = intel.get("review_candidates", [])
+    lag_sorted = sorted(lag, key=lambda s: s.get("signal_strength", 0.0), reverse=True)
+    review_sorted = sorted(review, key=lambda s: s.get("relationship_score", 0.0), reverse=True)
+    print("\nINTELLIGENCE SUMMARY", file=file)
+    print(f"  Opportunities:            {len(intel.get('opportunities', []))}", file=file)
+    print(f"  Reference-event clusters: {len(intel.get('reference_event_clusters', []))}", file=file)
+    print(f"  Lag signals:              {len(lag)}", file=file)
+    print(f"  Review candidates:        {len(review)}", file=file)
+    if lag_sorted:
+        print("  Top lag signals (by signal_strength):", file=file)
+        for s in lag_sorted[:5]:
+            leader = (s.get("leader_title") or "?")[:40]
+            laggard = (s.get("laggard_title") or "?")[:40]
+            print(
+                f"    [{s.get('signal_strength', 0.0):.3f}] {s.get('action', '?')}"
+                f" | leader: {leader} -> laggard: {laggard}",
+                file=file,
+            )
+    if review_sorted:
+        print("  Top review candidates (not trade recommendations):", file=file)
+        for s in review_sorted[:5]:
+            leader = (s.get("leader_title") or "?")[:40]
+            laggard = (s.get("laggard_title") or "?")[:40]
+            print(
+                f"    [relationship={s.get('relationship_score', 0.0):.3f}]"
+                f" | leader: {leader} -> laggard: {laggard}",
                 file=file,
             )
 

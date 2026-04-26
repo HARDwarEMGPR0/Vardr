@@ -143,6 +143,118 @@ def score_market_relationship(leader: dict, laggard: dict) -> dict:
     }
 
 
+def is_ambiguous_causal_pair(leader: dict, laggard: dict) -> tuple[bool, str]:
+    relationship_score = score_market_relationship(leader, laggard)
+    leader_move = _best_move(leader)
+    leader_text = _market_text(leader)
+    laggard_text = _market_text(laggard)
+
+    btc_leader = bool(re.search(r"\b(bitcoin|btc)\b", leader_text))
+    btc_price_up = bool(
+        leader_move is not None
+        and leader_move > 0
+        and (
+            re.search(r"\b(rally|bull|bullish|rise|rises|up|higher|high|record|1m|100k)\b", leader_text)
+            or btc_leader
+        )
+    )
+    mstr_sells_btc = bool(
+        re.search(r"\b(microstrategy|strategy|mstr)\b", laggard_text)
+        and re.search(r"\b(sell|sells|selling|sold)\b", laggard_text)
+        and re.search(r"\b(bitcoin|btc)\b", laggard_text)
+    )
+    if btc_leader and btc_price_up and mstr_sells_btc:
+        return True, "BTC bullishness does not clearly imply MicroStrategy is more likely to sell Bitcoin."
+
+    if relationship_score["relationship"] == "reference_event_only":
+        return True, "Shared reference-event exposure does not establish a causal lag relationship."
+
+    if relationship_score["expected_direction"] == "unknown":
+        return True, "Expected causal direction is unknown."
+
+    if relationship_score["score"] <= 0.45:
+        return True, "Relationship score is borderline for a direct trade signal."
+
+    return False, ""
+
+
+def _lag_action(leader_move: float, expected_direction: str) -> str:
+    if expected_direction == "same":
+        return "buy_yes_laggard" if leader_move > 0 else "buy_no_laggard"
+    return "buy_no_laggard" if leader_move > 0 else "buy_yes_laggard"
+
+
+def _signal_strength(leader_move: float, laggard_move: float | None, laggard: dict, relationship_score: dict) -> float:
+    signal_strength = (
+        abs(leader_move) - abs(laggard_move or 0.0)
+    ) * relationship_score["score"]
+    if laggard.get("spread") is not None and laggard["spread"] <= 0.05:
+        signal_strength += 0.05
+    if laggard.get("depth_top5") is not None and laggard["depth_top5"] >= 10_000:
+        signal_strength += 0.05
+    return round(signal_strength, 4)
+
+
+def _review_candidate(
+    leader: dict,
+    laggard: dict,
+    leader_move: float,
+    laggard_move: float | None,
+    relationship_score: dict,
+    reason: str,
+) -> dict:
+    return {
+        "type": "causal_review_candidate",
+        "leader_title": leader.get("title"),
+        "laggard_title": laggard.get("title"),
+        "leader_market_key": leader.get("market_key"),
+        "laggard_market_key": laggard.get("market_key"),
+        "leader_move": leader_move,
+        "laggard_move": laggard_move,
+        "relationship": relationship_score["relationship"],
+        "relationship_score": relationship_score["score"],
+        "reason": reason,
+        "review_question": (
+            "Does movement in the leader market imply same-direction, opposite-direction, "
+            "or no clear movement in the laggard market?"
+        ),
+    }
+
+
+def _lag_signal(
+    leader: dict,
+    laggard: dict,
+    leader_move: float,
+    laggard_move: float | None,
+    relationship_score: dict,
+) -> dict:
+    expected_direction = relationship_score["expected_direction"]
+    action = _lag_action(leader_move, expected_direction)
+    laggard_move_display = laggard_move if laggard_move is not None else 0.0
+    signal_strength = _signal_strength(leader_move, laggard_move, laggard, relationship_score)
+    return {
+        "type": "lagging_correlated_market",
+        "leader_market_key": leader.get("market_key"),
+        "laggard_market_key": laggard.get("market_key"),
+        "leader_title": leader.get("title"),
+        "laggard_title": laggard.get("title"),
+        "leader_move": leader_move,
+        "laggard_move": laggard_move,
+        "signal_strength": signal_strength,
+        "action": action,
+        "relationship": relationship_score["relationship"],
+        "relationship_score": relationship_score["score"],
+        "relationship_reasons": relationship_score["reasons"],
+        "expected_direction": expected_direction,
+        "reason": (
+            f"Leader market moved {leader_move:+.3f} while related laggard "
+            f"shows no significant price movement ({laggard_move_display:+.3f}). "
+            f"Relationship '{relationship_score['relationship']}' scored "
+            f"{relationship_score['score']:.2f}, suggesting delayed price "
+            "discovery may be tradable in the laggard market."
+        ),
+    }
+
 
 def _best_move(m: dict) -> float | None:
     """Return the best available price movement: delta > 1h change > 1d change."""
@@ -347,8 +459,26 @@ def detect_lagging_correlated_markets(
     laggard_threshold: float = 0.01,
     relationship_threshold: float = 0.45,
 ):
-    """Flag laggards only when the leader relationship is strong and directional."""
-    signals = []
+    """Return only direct lag signals, preserving the historical list return type."""
+    return detect_lagging_correlated_markets_with_review(
+        markets=markets,
+        leader_markets=leader_markets,
+        leader_threshold=leader_threshold,
+        laggard_threshold=laggard_threshold,
+        relationship_threshold=relationship_threshold,
+    )["lag_signals"]
+
+
+def detect_lagging_correlated_markets_with_review(
+    markets,
+    leader_markets,
+    leader_threshold: float = 0.02,
+    laggard_threshold: float = 0.01,
+    relationship_threshold: float = 0.45,
+) -> dict:
+    """Split correlated lag opportunities into direct signals and review candidates."""
+    lag_signals = []
+    review_candidates = []
 
     for leader in leader_markets:
         leader_move = _best_move(leader)
@@ -379,6 +509,26 @@ def detect_lagging_correlated_markets(
                 continue
 
             if relationship_score["score"] < relationship_threshold:
+                ambiguous, ambiguous_reason = is_ambiguous_causal_pair(leader, laggard)
+                if ambiguous and relationship_score["score"] > 0:
+                    review_candidates.append(
+                        _review_candidate(
+                            leader,
+                            laggard,
+                            leader_move,
+                            laggard_move,
+                            relationship_score,
+                            ambiguous_reason,
+                        )
+                    )
+                    LOGGER.debug(
+                        "  review candidate | laggard=%s relationship=%s score=%s reason=%s",
+                        laggard.get("market_key"),
+                        relationship_score["relationship"],
+                        relationship_score["score"],
+                        ambiguous_reason,
+                    )
+                    continue
                 LOGGER.debug(
                     "  skipped weak relationship score | laggard=%s score=%s threshold=%s relationship=%s",
                     laggard.get("market_key"),
@@ -389,6 +539,27 @@ def detect_lagging_correlated_markets(
                 continue
 
             expected_direction = relationship_score["expected_direction"]
+            ambiguous, ambiguous_reason = is_ambiguous_causal_pair(leader, laggard)
+            if ambiguous:
+                review_candidates.append(
+                    _review_candidate(
+                        leader,
+                        laggard,
+                        leader_move,
+                        laggard_move,
+                        relationship_score,
+                        ambiguous_reason,
+                    )
+                )
+                LOGGER.debug(
+                    "  review candidate | laggard=%s relationship=%s score=%s reason=%s",
+                    laggard.get("market_key"),
+                    relationship_score["relationship"],
+                    relationship_score["score"],
+                    ambiguous_reason,
+                )
+                continue
+
             if expected_direction == "unknown":
                 LOGGER.debug(
                     "  skipped unknown expected direction | laggard=%s relationship=%s reasons=%s",
@@ -398,47 +569,14 @@ def detect_lagging_correlated_markets(
                 )
                 continue
 
-            signal_strength = (
-                abs(leader_move) - abs(laggard_move or 0.0)
-            ) * relationship_score["score"]
-            if laggard.get("spread") is not None and laggard["spread"] <= 0.05:
-                signal_strength += 0.05
-            if laggard.get("depth_top5") is not None and laggard["depth_top5"] >= 10_000:
-                signal_strength += 0.05
-
-            if expected_direction == "same":
-                action = "buy_yes_laggard" if leader_move > 0 else "buy_no_laggard"
-            else:
-                action = "buy_no_laggard" if leader_move > 0 else "buy_yes_laggard"
-            laggard_move_display = laggard_move if laggard_move is not None else 0.0
+            signal = _lag_signal(leader, laggard, leader_move, laggard_move, relationship_score)
 
             LOGGER.debug(
                 "  signal emitted | laggard=%s strength=%.4f action=%s relationship=%s score=%s",
-                laggard.get("market_key"), signal_strength, action,
+                laggard.get("market_key"), signal["signal_strength"], signal["action"],
                 relationship_score["relationship"], relationship_score["score"],
             )
 
-            signals.append({
-                "type": "lagging_correlated_market",
-                "leader_market_key": leader.get("market_key"),
-                "laggard_market_key": laggard.get("market_key"),
-                "leader_title": leader.get("title"),
-                "laggard_title": laggard.get("title"),
-                "leader_move": leader_move,
-                "laggard_move": laggard_move,
-                "signal_strength": round(signal_strength, 4),
-                "action": action,
-                "relationship": relationship_score["relationship"],
-                "relationship_score": relationship_score["score"],
-                "relationship_reasons": relationship_score["reasons"],
-                "expected_direction": expected_direction,
-                "reason": (
-                    f"Leader market moved {leader_move:+.3f} while related laggard "
-                    f"shows no significant price movement ({laggard_move_display:+.3f}). "
-                    f"Relationship '{relationship_score['relationship']}' scored "
-                    f"{relationship_score['score']:.2f}, suggesting delayed price "
-                    "discovery may be tradable in the laggard market."
-                ),
-            })
+            lag_signals.append(signal)
 
-    return signals
+    return {"lag_signals": lag_signals, "review_candidates": review_candidates}
