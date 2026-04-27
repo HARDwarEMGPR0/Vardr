@@ -77,6 +77,10 @@ def _same_market(leader: dict, laggard: dict) -> bool:
 
 
 def _reference_event_label(market: dict) -> str | None:
+    meta = market.get("resolution_meta") or {}
+    meta_ref = normalize_text(meta.get("reference_event"))
+    if meta_ref:
+        return meta_ref
     ref = normalize_text(market.get("reference_event"))
     text = _market_text(market)
     if ref:
@@ -84,6 +88,42 @@ def _reference_event_label(market: dict) -> str | None:
     if re.search(r"\bgta\s*(vi|6)?\b", text):
         return "gta vi"
     return None
+
+
+def _resolution_meta(market: dict) -> dict:
+    return market.get("resolution_meta") or {}
+
+
+def _deadline_confidence(market: dict) -> float:
+    try:
+        return float(_resolution_meta(market).get("deadline_confidence") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _resolution_rule_type(market: dict) -> str:
+    return str(_resolution_meta(market).get("rule_type") or "unknown")
+
+
+def _reference_event_causal_direction(leader: dict, laggard: dict, leader_move: float | None = None) -> tuple[str, str] | None:
+    leader_meta = _resolution_meta(leader)
+    laggard_meta = _resolution_meta(laggard)
+    leader_ref = normalize_text(leader_meta.get("reference_event"))
+    laggard_ref = normalize_text(laggard_meta.get("reference_event"))
+    if not leader_ref or leader_ref != laggard_ref:
+        return None
+
+    leader_rule = _resolution_rule_type(leader)
+    laggard_rule = _resolution_rule_type(laggard)
+    if leader_rule not in {"fixed_date", "release_timing"} or laggard_rule != "before_reference_event":
+        return None
+
+    if min(_deadline_confidence(leader), _deadline_confidence(laggard)) < 0.6:
+        return None
+
+    if leader_move is not None and leader_move > 0:
+        return "opposite", "deadline compression reduces probability of X occurring before event"
+    return "unknown", "reference-event timing relationship is known but leader move direction is not usable"
 
 
 def score_market_relationship(leader: dict, laggard: dict) -> dict:
@@ -102,7 +142,13 @@ def score_market_relationship(leader: dict, laggard: dict) -> dict:
     laggard_ref = _reference_event_label(laggard)
     same_ref = bool(leader_ref and laggard_ref and leader_ref == laggard_ref)
 
-    if same_ref:
+    directional_ref = _reference_event_causal_direction(leader, laggard, _best_move(leader))
+    if directional_ref:
+        direction, direction_reason = directional_ref
+        score += 0.65
+        reasons.append(f"resolution-aware reference-event link: {direction_reason}")
+        expected_direction = direction
+    elif same_ref:
         score += 0.25
         reasons.append(f"shared reference_event: {leader_ref}")
 
@@ -125,7 +171,11 @@ def score_market_relationship(leader: dict, laggard: dict) -> dict:
 
     score = min(1.0, score)
 
-    if same_semantic_group and same_ref:
+    if directional_ref and same_semantic_group:
+        relationship = "same_semantic_group_and_reference_event"
+    elif directional_ref:
+        relationship = "resolution_aware_reference_event"
+    elif same_semantic_group and same_ref:
         relationship = "same_semantic_group_and_reference_event"
     elif same_semantic_group:
         relationship = "same_semantic_group"
@@ -148,6 +198,10 @@ def is_ambiguous_causal_pair(leader: dict, laggard: dict) -> tuple[bool, str]:
     leader_move = _best_move(leader)
     leader_text = _market_text(leader)
     laggard_text = _market_text(laggard)
+    same_ref = bool(_reference_event_label(leader) and _reference_event_label(leader) == _reference_event_label(laggard))
+
+    if same_ref and min(_deadline_confidence(leader), _deadline_confidence(laggard)) < 0.5:
+        return True, "insufficient resolution-rule confidence"
 
     btc_leader = bool(re.search(r"\b(bitcoin|btc)\b", leader_text))
     btc_price_up = bool(
@@ -168,6 +222,9 @@ def is_ambiguous_causal_pair(leader: dict, laggard: dict) -> tuple[bool, str]:
 
     if relationship_score["relationship"] == "reference_event_only":
         return True, "Shared reference-event exposure does not establish a causal lag relationship."
+
+    if same_ref and relationship_score["relationship"] != "resolution_aware_reference_event":
+        return True, "Shared reference-event exposure is not tradable without high-confidence causal timing rules."
 
     if relationship_score["expected_direction"] == "unknown":
         return True, "Expected causal direction is unknown."
@@ -203,6 +260,7 @@ def _review_candidate(
     relationship_score: dict,
     reason: str,
 ) -> dict:
+    meta = _resolution_meta(laggard)
     return {
         "type": "causal_review_candidate",
         "leader_title": leader.get("title"),
@@ -213,6 +271,9 @@ def _review_candidate(
         "laggard_move": laggard_move,
         "relationship": relationship_score["relationship"],
         "relationship_score": relationship_score["score"],
+        "resolution_deadline_utc": meta.get("resolution_deadline_utc"),
+        "deadline_confidence": meta.get("deadline_confidence"),
+        "rule_type": meta.get("rule_type"),
         "reason": reason,
         "review_question": (
             "Does movement in the leader market imply same-direction, opposite-direction, "
@@ -232,6 +293,7 @@ def _lag_signal(
     action = _lag_action(leader_move, expected_direction)
     laggard_move_display = laggard_move if laggard_move is not None else 0.0
     signal_strength = _signal_strength(leader_move, laggard_move, laggard, relationship_score)
+    meta = _resolution_meta(laggard)
     return {
         "type": "lagging_correlated_market",
         "leader_market_key": leader.get("market_key"),
@@ -246,6 +308,9 @@ def _lag_signal(
         "relationship_score": relationship_score["score"],
         "relationship_reasons": relationship_score["reasons"],
         "expected_direction": expected_direction,
+        "resolution_deadline_utc": meta.get("resolution_deadline_utc"),
+        "deadline_confidence": meta.get("deadline_confidence"),
+        "rule_type": meta.get("rule_type"),
         "reason": (
             f"Leader market moved {leader_move:+.3f} while related laggard "
             f"shows no significant price movement ({laggard_move_display:+.3f}). "

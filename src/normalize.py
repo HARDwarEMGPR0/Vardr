@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from market_fetcher.resolution_parser import parse_resolution_metadata
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -55,7 +57,7 @@ def normalize_polymarket_market(market: dict[str, Any], ts_utc: str | None = Non
     if depth_total is None:
         depth_total = depth_yes + depth_no
 
-    return {
+    snapshot = {
         "ts_utc": ts,
         "venue": "polymarket",
         "market_key": market.get("conditionId") or market.get("id") or market.get("market_key"),
@@ -81,6 +83,8 @@ def normalize_polymarket_market(market: dict[str, Any], ts_utc: str | None = Non
         "trades_count_sample": None,
         "minute_features": None,
     }
+    snapshot["resolution_meta"] = parse_resolution_metadata({**market, **snapshot})
+    return snapshot
 
 
 def _sum_trades_volume(trades_json: dict[str, Any]) -> float | None:
@@ -187,5 +191,6 @@ def normalize_kalshi_market(
     }
 
     snapshot["minute_features"] = minute_features
+    snapshot["resolution_meta"] = parse_resolution_metadata({**market_json, **snapshot})
 
     return snapshot

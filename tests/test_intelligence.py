@@ -299,6 +299,72 @@ def test_reference_event_only_pair_becomes_review_candidate_not_lag_signal():
     assert result["review_candidates"][0]["relationship"] == "reference_event_only"
 
 
+def test_low_confidence_reference_markets_never_produce_lag_signals():
+    leader = {
+        "title": "GTA VI released before June 2026?",
+        "market_key": "gta-release",
+        "computed_mid_delta": 0.05,
+        "resolution_meta": {
+            "reference_event": "GTA VI",
+            "rule_type": "release_timing",
+            "deadline_confidence": 0.3,
+            "resolution_deadline_utc": "2026-06-01T00:00:00Z",
+        },
+    }
+    laggard = {
+        "title": "Will Jesus Christ return before GTA VI?",
+        "market_key": "jesus-gta",
+        "computed_mid_delta": 0.0,
+        "resolution_meta": {
+            "reference_event": "GTA VI",
+            "rule_type": "before_reference_event",
+            "deadline_confidence": 0.3,
+            "resolution_deadline_utc": None,
+        },
+    }
+
+    result = detect_lagging_correlated_markets_with_review([laggard], [leader])
+    assert result["lag_signals"] == []
+    assert len(result["review_candidates"]) == 1
+    assert result["review_candidates"][0]["reason"] == "insufficient resolution-rule confidence"
+
+
+def test_deadline_aware_causal_direction_uses_opposite_logic():
+    leader = {
+        "title": "GTA VI released before June 30, 2026?",
+        "market_key": "gta-release",
+        "computed_mid_delta": 0.05,
+        "resolution_meta": {
+            "reference_event": "GTA VI",
+            "rule_type": "release_timing",
+            "deadline_confidence": 0.85,
+            "resolution_deadline_utc": "2026-06-30T00:00:00Z",
+        },
+    }
+    laggard = {
+        "title": "Will Jesus Christ return before GTA VI?",
+        "market_key": "jesus-gta",
+        "computed_mid_delta": 0.0,
+        "resolution_meta": {
+            "reference_event": "GTA VI",
+            "rule_type": "before_reference_event",
+            "deadline_confidence": 0.85,
+            "resolution_deadline_utc": None,
+        },
+    }
+
+    result = detect_lagging_correlated_markets_with_review([laggard], [leader])
+    assert result["review_candidates"] == []
+    assert len(result["lag_signals"]) == 1
+    signal = result["lag_signals"][0]
+    assert signal["expected_direction"] == "opposite"
+    assert signal["action"] == "buy_no_laggard"
+    assert signal["relationship"] == "resolution_aware_reference_event"
+    assert "deadline compression" in signal["relationship_reasons"][0]
+    assert signal["deadline_confidence"] == 0.85
+    assert signal["rule_type"] == "before_reference_event"
+
+
 def test_no_emitted_signal_uses_shared_keyword_theme_relationship():
     leader = {
         "title": "Will Bitcoin ETF hit record high?",
