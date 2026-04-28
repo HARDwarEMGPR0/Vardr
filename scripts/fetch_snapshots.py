@@ -24,7 +24,11 @@ from market_fetcher.intelligence import (
     detect_reference_event_clusters,
     detect_lagging_correlated_markets_with_review,
 )
-from market_fetcher.leader_markets import load_leader_markets, load_leader_markets_from_vardr_api
+from market_fetcher.leader_markets import (
+    load_leader_markets,
+    load_leader_markets_from_vardr1,
+    load_leader_markets_from_vardr_api,
+)
 
 
 from src.connectors.kalshi_public import fetch_markets as fetch_kalshi_markets  # noqa: E402
@@ -397,13 +401,15 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             loaded_leaders = load_leader_markets_from_vardr_api(vardr_leader_api_url)
         elif leader_markets_json:
             loaded_leaders = load_leader_markets(leader_markets_json)
+        else:
+            loaded_leaders = load_leader_markets_from_vardr1()
     except Exception as exc:
         leader_error = f"leader_markets_error: {exc}"
         loaded_leaders = []
 
     lag_review = detect_lagging_correlated_markets_with_review(
         markets=polymarket_snapshots,
-        leader_markets=loaded_leaders if loaded_leaders else polymarket_snapshots,
+        leader_markets=loaded_leaders,
     )
     lag_signals = lag_review["lag_signals"]
     review_candidates = lag_review["review_candidates"]

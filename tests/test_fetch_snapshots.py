@@ -174,6 +174,16 @@ class FetchSnapshotTests(unittest.TestCase):
         self.assertIn("lag_signals", payload["intelligence"])
         self.assertIn("review_candidates", payload["intelligence"])
 
+    def test_f_pipeline_uses_vardr1_by_default_without_internal_leader_fallback(self) -> None:
+        with patch("scripts.fetch_snapshots.load_leader_markets_from_vardr1", return_value=[]) as loader:
+            with patch("scripts.fetch_snapshots.detect_lagging_correlated_markets_with_review") as detector:
+                detector.return_value = {"lag_signals": [], "review_candidates": []}
+                run_pipeline(self._fixture_args())
+
+        loader.assert_called_once_with()
+        detector.assert_called_once()
+        self.assertEqual(detector.call_args.kwargs["leader_markets"], [])
+
     def test_g_history_jsonl_writes_one_line(self) -> None:
         from scripts.fetch_snapshots import _append_run_to_jsonl
 

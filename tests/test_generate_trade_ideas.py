@@ -4,6 +4,7 @@ from pathlib import Path
 
 from scripts.generate_trade_ideas import (
     build_prompt,
+    build_structured_input,
     get_execution_risk,
     get_market_context,
     load_snapshot,
@@ -172,6 +173,40 @@ def test_prompt_includes_system_instruction():
     prompt = build_prompt(_make_snapshot())
     assert "SYSTEM INSTRUCTION" in prompt
     assert "prediction-market trade idea analyst" in prompt
+
+
+def test_build_structured_input_has_claude_contract():
+    structured = build_structured_input(
+        _make_snapshot(
+            lag_signals=[_lag_signal("primary", 0.10)],
+            review_candidates=[{"leader_title": "Review", "relationship_score": 0.4}],
+        )
+    )
+
+    assert set(structured) == {"primary_trades", "review_candidates", "reasoning_context"}
+    assert structured["primary_trades"][0]["laggard_market_key"] == "primary"
+    assert structured["review_candidates"][0]["leader_title"] == "Review"
+    assert "does not predict event outcomes" in structured["reasoning_context"][0]["message"]
+
+
+def test_build_structured_input_accepts_live_lag_candidates_response():
+    live_payload = {
+        "claude_input": {
+            "primary_trades": [{"id": "p1"}],
+            "review_candidates": [{"id": "r1"}],
+            "reasoning_context": [{"id": "ctx"}],
+        }
+    }
+
+    assert build_structured_input(live_payload) == live_payload["claude_input"]
+
+
+def test_prompt_includes_structured_claude_input_block():
+    prompt = build_prompt(_make_snapshot())
+
+    assert "STRUCTURED CLAUDE INPUT" in prompt
+    assert '"primary_trades"' in prompt
+    assert '"review_candidates"' in prompt
 
 
 def test_prompt_sorts_lag_signals_by_strength():

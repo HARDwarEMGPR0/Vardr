@@ -9,6 +9,7 @@ import re
 import traceback
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -16,9 +17,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+from market_fetcher.leader_markets import load_leader_markets_from_vardr1
+from market_fetcher.lag_candidates import (
+    DEFAULT_LEADER_FETCH_LIMIT,
+    DEFAULT_MAX_ABS_LEADER_MOVE,
+    DEFAULT_MAX_CANDIDATES_PER_EVENT_OUTPUT,
+    DEFAULT_MAX_CANDIDATES_PER_LEADER_OUTPUT,
+    DEFAULT_MAX_LEADERS_EVALUATED,
+    DEFAULT_MIN_DIVERGENCE,
+    DEFAULT_MIN_RELATED_ABS_MOVE_24H,
+    DEFAULT_MIN_SIMILARITY,
+    DEFAULT_MIN_SIMILARITY_FOR_TRADE,
+    DEFAULT_MIN_VALID_CANDIDATES,
+    DEFAULT_TIMEOUT_SECONDS,
+    build_lag_candidates_debug,
+    build_lag_candidates_with_metadata,
+    load_local_polymarket_universe_with_metadata,
+)
+from market_fetcher.vardr1_client import map_vardr1_market_to_leader
 from src.market_resolver import TradeIntent, resolve_trade_detailed
 
 LOGGER = logging.getLogger(__name__)
+ROOT_DIR = Path(__file__).resolve().parents[1]
 
 app = FastAPI(title="True Markets Resolver API", version="1.0.0")
 
@@ -33,31 +53,6 @@ LEADER_MARKET_FIELDS = (
     "source",
     "reason",
 )
-
-DEMO_LEADER_MARKETS = [
-    {
-        "title": "Will bitcoin hit $1m before GTA VI?",
-        "market_key": "vardr_btc_leader_1",
-        "reference_event": "GTA VI",
-        "mid": 0.56,
-        "computed_mid_delta": 0.05,
-        "one_hour_price_change": 0.05,
-        "one_day_price_change": 0.08,
-        "source": "vardr",
-        "reason": "Demo leader market showing a meaningful positive move.",
-    },
-    {
-        "title": "Will Ethereum ETF volume rise this week?",
-        "market_key": "vardr_eth_leader_low_move",
-        "reference_event": None,
-        "mid": 0.49,
-        "computed_mid_delta": 0.01,
-        "one_hour_price_change": 0.01,
-        "one_day_price_change": 0.015,
-        "source": "vardr",
-        "reason": "Demo low-move leader used to exercise filtering.",
-    },
-]
 
 app.add_middleware(
     CORSMiddleware,
@@ -120,29 +115,140 @@ def _best_leader_move(market: dict) -> float | None:
 
 
 def normalize_leader_market(raw: dict) -> dict:
-    title = raw.get("title") or raw.get("question")
-    if not title:
+    normalized = map_vardr1_market_to_leader(raw)
+    if not normalized:
         return {}
-
-    normalized = {
-        "title": str(title),
-        "market_key": raw.get("market_key") or raw.get("id") or raw.get("ticker") or raw.get("slug"),
-        "reference_event": raw.get("reference_event"),
-        "mid": raw.get("mid"),
-        "computed_mid_delta": raw.get("computed_mid_delta"),
-        "one_hour_price_change": raw.get("one_hour_price_change"),
-        "one_day_price_change": raw.get("one_day_price_change"),
-        "source": raw.get("source") or "vardr",
-        "reason": raw.get("reason"),
-    }
     if not normalized["market_key"]:
         normalized["market_key"] = _fallback_market_key(normalized["title"])
     return normalized
 
 
-def get_leader_markets() -> list[dict]:
-    normalized = [normalize_leader_market(market) for market in DEMO_LEADER_MARKETS]
-    return [market for market in normalized if market]
+def get_leader_markets(limit: int = DEFAULT_LEADER_FETCH_LIMIT) -> list[dict]:
+    return load_leader_markets_from_vardr1(limit=limit)
+
+
+def _demo_lag_fixture() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    leaders = [
+        {
+            "title": "Will the Fed cut rates by June 2026?",
+            "market_key": "demo-leader-fed-cut-june-2026",
+            "market_id": "demo-leader-fed-cut-june-2026",
+            "market_title": "Will the Fed cut rates by June 2026?",
+            "current_price": 0.58,
+            "one_hour_price_change": 0.16,
+            "one_day_price_change": 0.21,
+            "price_change_1h": 0.16,
+            "price_change_24h": 0.21,
+            "leader_score": 0.63,
+            "source": "demo_snapshot",
+        }
+    ]
+    universe = [
+        {
+            "venue": "polymarket",
+            "market_key": "demo-related-mortgage-rates-below-6",
+            "market_id": "demo-related-mortgage-rates-below-6",
+            "title": "Will 30-year mortgage rates fall below 6% by June 2026?",
+            "question": "Will 30-year mortgage rates fall below 6% by June 2026?",
+            "one_hour_price_change": 0.01,
+            "one_day_price_change": 0.018,
+            "mid": 0.44,
+            "current_price": 0.44,
+            "spread": 0.025,
+            "depth_top5": 4200,
+            "liquidity_proxy": 4200,
+            "source": "demo_snapshot",
+        }
+    ]
+    return leaders, universe, {
+        "source": "demo_snapshot",
+        "source_path": "built_in_demo_fixture",
+        "row_count": len(universe),
+    }
+
+
+def _candidate_trade_view(candidate: dict[str, Any]) -> dict[str, Any]:
+    def rounded(value: Any) -> Any:
+        if isinstance(value, (int, float)):
+            return round(float(value), 3)
+        return value
+
+    execution_risk_score = rounded(candidate.get("execution_risk_score"))
+    similarity_score = rounded(candidate.get("similarity_score"))
+    divergence = rounded(candidate.get("divergence_score"))
+    confidence = rounded(candidate.get("trade_rank_score"))
+    trade_rank_score = rounded(candidate.get("trade_rank_score"))
+    reason = (
+        "The leader market moved sharply while the related market barely moved, despite a "
+        f"{candidate.get('expected_correlation_direction')} causal relationship. Because execution risk is "
+        f"{candidate.get('execution_risk_label')}, Vardr flags the related market as a "
+        f"{candidate.get('trade_bucket')} trade candidate."
+    )
+    return {
+        "leader_market": {
+            "market_id": candidate.get("leader_market_id"),
+            "title": candidate.get("leader_market_title"),
+            "price_change_1h": candidate.get("leader_price_change_1h"),
+            "price_change_24h": candidate.get("leader_price_change_24h"),
+        },
+        "lagging_market": {
+            "market_id": candidate.get("related_market_id"),
+            "title": candidate.get("related_market_title"),
+            "price_change_1h": candidate.get("related_price_change_1h"),
+            "price_change_24h": candidate.get("related_price_change_24h"),
+        },
+        "suggested_trade_direction": candidate.get("suggested_trade_direction"),
+        "relationship_type": candidate.get("relationship_type"),
+        "expected_direction": candidate.get("expected_correlation_direction"),
+        "similarity_score": similarity_score,
+        "divergence": divergence,
+        "confidence": confidence,
+        "execution_risk_score": execution_risk_score,
+        "execution_risk_label": candidate.get("execution_risk_label"),
+        "execution_risk_drivers": candidate.get("execution_risk_drivers"),
+        "liquidity_score": rounded(candidate.get("liquidity_score")),
+        "trade_rank_score": trade_rank_score,
+        "trade_bucket": candidate.get("trade_bucket"),
+        "execution_risk": {
+            "risk_score": execution_risk_score,
+            "risk_label": candidate.get("execution_risk_label"),
+            "drivers": candidate.get("execution_risk_drivers"),
+        },
+        "reason": reason,
+        "trade_reason": reason,
+        "data_source": candidate.get("data_source") or candidate.get("source") or "live",
+    }
+
+
+def _claude_trade_context(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    primary = [
+        _candidate_trade_view(candidate)
+        for candidate in candidates
+        if candidate.get("trade_bucket") == "primary" and candidate.get("tradable_signal") is True
+    ]
+    review = [
+        _candidate_trade_view(candidate)
+        for candidate in candidates
+        if candidate.get("trade_bucket") != "primary" or candidate.get("tradable_signal") is not True
+    ]
+    reasoning = [
+        {
+            "market_id": candidate.get("related_market_id"),
+            "relationship_type": candidate.get("relationship_type"),
+            "relationship_reason": candidate.get("relationship_reason") or candidate.get("causal_link_reason"),
+            "do_not_hallucinate_causality": candidate.get("relationship_type") not in {
+                "CAUSALLY_LINKED",
+                "SAME_OPTION_SET_NEGATIVE_CORRELATION",
+                "SAME_OPTION_SET_POSITIVE_CORRELATION",
+            },
+        }
+        for candidate in candidates
+    ]
+    return {
+        "primary_trades": primary,
+        "review_candidates": review,
+        "reasoning_context": reasoning,
+    }
 
 
 def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
@@ -172,6 +278,159 @@ def leader_markets(
         if len(leaders) >= limit:
             break
     return leaders
+
+
+@app.get("/lag-candidates")
+def lag_candidates(
+    limit: int = Query(default=50, ge=1),
+    min_similarity: float = Query(default=DEFAULT_MIN_SIMILARITY, ge=0.0, le=1.0),
+    min_divergence: float = Query(default=DEFAULT_MIN_DIVERGENCE, ge=0.0),
+    leader_fetch_limit: int = Query(default=DEFAULT_LEADER_FETCH_LIMIT, ge=1),
+    leader_offset: int = Query(default=0, ge=0),
+    leader_page_size: int = Query(default=25, ge=1, le=50),
+    max_leaders_evaluated: int = Query(default=DEFAULT_MAX_LEADERS_EVALUATED, ge=1),
+    min_valid_candidates: int = Query(default=DEFAULT_MIN_VALID_CANDIDATES, ge=0),
+    max_universe: int = Query(default=5000, ge=1),
+    max_candidates_per_leader: int = Query(default=25, ge=1),
+    max_candidates_per_leader_output: int = Query(default=DEFAULT_MAX_CANDIDATES_PER_LEADER_OUTPUT, ge=1),
+    max_candidates_per_event_output: int = Query(default=DEFAULT_MAX_CANDIDATES_PER_EVENT_OUTPUT, ge=1),
+    include_review_only: bool = Query(default=False),
+    max_abs_leader_move: float = Query(default=DEFAULT_MAX_ABS_LEADER_MOVE, ge=0.0),
+    exploratory: bool = Query(default=False),
+    include_weak_similarity: bool = Query(default=False),
+    timeout_seconds: float = Query(default=DEFAULT_TIMEOUT_SECONDS, ge=0.1, le=60.0),
+    min_leaders_before_timeout: int = Query(default=5, ge=0),
+    min_related_abs_move_24h: float = Query(default=DEFAULT_MIN_RELATED_ABS_MOVE_24H, ge=0.0),
+    min_similarity_for_trade: float = Query(default=DEFAULT_MIN_SIMILARITY_FOR_TRADE, ge=0.0, le=1.0),
+    demo: bool = Query(default=False),
+) -> dict[str, Any]:
+    start = time.monotonic()
+    if demo:
+        leaders, polymarket_universe, universe_metadata = _demo_lag_fixture()
+        leaders_done = time.monotonic()
+        universe_done = leaders_done
+    else:
+        leaders = get_leader_markets(limit=leader_fetch_limit)
+        leaders_done = time.monotonic()
+        polymarket_universe, universe_metadata = load_local_polymarket_universe_with_metadata(ROOT_DIR)
+        universe_done = time.monotonic()
+    total_leaders_available = len(leaders)
+    leader_slice_start = min(leader_offset, total_leaders_available)
+    leader_slice_end = min(leader_slice_start + leader_page_size, total_leaders_available)
+    leader_slice = leaders[leader_slice_start:leader_slice_end]
+    candidates, candidate_metadata = build_lag_candidates_with_metadata(
+        leader_markets=leader_slice,
+        polymarket_universe=polymarket_universe,
+        min_similarity=min_similarity,
+        min_divergence=min_divergence,
+        limit=limit,
+        max_leaders_evaluated=max_leaders_evaluated,
+        min_valid_candidates=min_valid_candidates,
+        max_universe=max_universe,
+        max_candidates_per_leader=max_candidates_per_leader,
+        max_candidates_per_leader_output=max_candidates_per_leader_output,
+        max_candidates_per_event_output=max_candidates_per_event_output,
+        include_review_only=include_review_only,
+        max_abs_leader_move=max_abs_leader_move,
+        exploratory=exploratory,
+            include_weak_similarity=include_weak_similarity,
+            timeout_seconds=timeout_seconds,
+            min_leaders_before_timeout=min_leaders_before_timeout,
+            min_related_abs_move_24h=min_related_abs_move_24h,
+            min_similarity_for_trade=0.30 if demo else min_similarity_for_trade,
+        )
+    scoring_done = time.monotonic()
+    candidate_metadata["universe_row_count"] = universe_metadata.get("row_count")
+    candidate_metadata["leader_offset"] = leader_offset
+    candidate_metadata["leader_page_size"] = leader_page_size
+    candidate_metadata["leader_slice_start"] = leader_slice_start
+    candidate_metadata["leader_slice_end"] = leader_slice_end
+    candidate_metadata["total_leaders_available"] = total_leaders_available
+    candidate_metadata["next_leader_offset"] = leader_slice_end if leader_slice_end < total_leaders_available else None
+    candidate_metadata["demo_mode"] = demo
+    candidate_metadata["data_source"] = "demo_snapshot" if demo else "live"
+    if demo:
+        for candidate in candidates:
+            candidate["data_source"] = "demo_snapshot"
+            candidate["demo_candidate"] = True
+    LOGGER.warning(
+        "lag_candidates timing fetch_leaders_s=%.4f load_universe_s=%.4f scoring_s=%.4f leaders_fetched=%d leader_slice=%d:%d leaders_evaluated=%d leaders_skipped=%d returned=%d universe_rows=%s source=%s",
+        leaders_done - start,
+        universe_done - leaders_done,
+        scoring_done - universe_done,
+        len(leaders),
+        leader_slice_start,
+        leader_slice_end,
+        candidate_metadata["leaders_evaluated"],
+        candidate_metadata["leaders_skipped"],
+        len(candidates),
+        universe_metadata.get("row_count"),
+        universe_metadata.get("source_path"),
+    )
+    claude_input = _claude_trade_context(candidates)
+    return {
+        "candidates": candidates,
+        "primary_trades": claude_input["primary_trades"],
+        "review_candidates": claude_input["review_candidates"],
+        "reasoning_context": claude_input["reasoning_context"],
+        "claude_input": claude_input,
+        "metadata": candidate_metadata,
+    }
+
+
+@app.get("/lag-candidates/debug")
+def lag_candidates_debug(
+    leader_limit: int = Query(default=5, ge=1),
+    leader_fetch_limit: int = Query(default=DEFAULT_LEADER_FETCH_LIMIT, ge=1),
+    max_universe: int = Query(default=5000, ge=1),
+    top_k: int = Query(default=10, ge=1),
+    min_valid_candidates: int = Query(default=DEFAULT_MIN_VALID_CANDIDATES, ge=0),
+    exploratory: bool = Query(default=False),
+    include_weak_similarity: bool = Query(default=False),
+    min_similarity: float = Query(default=DEFAULT_MIN_SIMILARITY, ge=0.0, le=1.0),
+    min_divergence: float = Query(default=DEFAULT_MIN_DIVERGENCE, ge=0.0),
+    timeout_seconds: float = Query(default=DEFAULT_TIMEOUT_SECONDS, ge=0.1, le=60.0),
+    min_leaders_before_timeout: int = Query(default=5, ge=0),
+    max_abs_leader_move: float = Query(default=DEFAULT_MAX_ABS_LEADER_MOVE, ge=0.0),
+    min_related_abs_move_24h: float = Query(default=DEFAULT_MIN_RELATED_ABS_MOVE_24H, ge=0.0),
+    min_similarity_for_trade: float = Query(default=DEFAULT_MIN_SIMILARITY_FOR_TRADE, ge=0.0, le=1.0),
+) -> list[dict[str, Any]]:
+    start = time.monotonic()
+    leaders = get_leader_markets(limit=leader_fetch_limit)
+    leaders_done = time.monotonic()
+    polymarket_universe, universe_metadata = load_local_polymarket_universe_with_metadata(ROOT_DIR)
+    universe_done = time.monotonic()
+    rows = build_lag_candidates_debug(
+        leader_markets=leaders,
+        polymarket_universe=polymarket_universe,
+        leader_limit=leader_limit,
+        top_candidates=top_k,
+        min_similarity=min_similarity,
+        min_divergence=min_divergence,
+        min_valid_candidates=min_valid_candidates,
+        max_universe=max_universe,
+        timeout_seconds=timeout_seconds,
+        min_leaders_before_timeout=min_leaders_before_timeout,
+        max_abs_leader_move=max_abs_leader_move,
+        min_related_abs_move_24h=min_related_abs_move_24h,
+        min_similarity_for_trade=min_similarity_for_trade,
+        exploratory=exploratory,
+        include_weak_similarity=include_weak_similarity,
+        universe_source_path=universe_metadata.get("source_path"),
+        universe_row_count=universe_metadata.get("row_count"),
+    )
+    scoring_done = time.monotonic()
+    LOGGER.warning(
+        "lag_candidates_debug timing fetch_leaders_s=%.4f load_universe_s=%.4f scoring_s=%.4f leaders=%d returned=%d universe_rows=%s source=%s",
+        leaders_done - start,
+        universe_done - leaders_done,
+        scoring_done - universe_done,
+        len(leaders),
+        len(rows),
+        universe_metadata.get("row_count"),
+        universe_metadata.get("source_path"),
+    )
+    return rows
 
 
 @app.post("/resolve_market")

@@ -6,10 +6,15 @@ from pathlib import Path
 
 import requests
 
+from market_fetcher.vardr1_client import fetch_vardr1_leader_markets, map_vardr1_market_to_leader
+
 LOGGER = logging.getLogger(__name__)
 
 
 def _normalize_leader_market(market: dict, source: str) -> dict:
+    if source == "vardr1":
+        return map_vardr1_market_to_leader(market)
+
     return {
         "title": market.get("title") or market.get("question") or "",
         "market_key": (
@@ -92,3 +97,17 @@ def load_leader_markets_from_vardr_api(url: str, timeout_seconds: float = 10.0) 
             )
         normalized.append(_normalize_leader_market(item, source="vardr_api"))
     return normalized
+
+
+def load_leader_markets_from_vardr1(
+    base_url: str | None = None,
+    window: str = "24h",
+    limit: int = 25,
+    timeout_seconds: float = 10.0,
+) -> list[dict]:
+    return fetch_vardr1_leader_markets(
+        base_url=base_url,
+        window=window,
+        limit=limit,
+        timeout_seconds=timeout_seconds,
+    )

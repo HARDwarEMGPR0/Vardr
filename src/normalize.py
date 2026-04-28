@@ -87,6 +87,40 @@ def normalize_polymarket_market(market: dict[str, Any], ts_utc: str | None = Non
     return snapshot
 
 
+def normalize_execution_market(snapshot: dict[str, Any], platform: str | None = None) -> dict[str, Any]:
+    """Return the product-facing cross-market execution schema.
+
+    The internal snapshot schema keeps venue-specific YES/NO fields. This view
+    exposes comparable YES-side pricing for Polymarket and Kalshi.
+    """
+
+    venue = platform or snapshot.get("platform") or snapshot.get("venue")
+    best_bid = to_float_or_none(snapshot.get("best_bid") or snapshot.get("best_yes_bid"))
+    best_ask = to_float_or_none(snapshot.get("best_ask") or snapshot.get("best_yes_ask"))
+    midpoint = to_float_or_none(snapshot.get("midpoint") or snapshot.get("mid"))
+    if midpoint is None and best_bid is not None and best_ask is not None:
+        midpoint = (best_bid + best_ask) / 2.0
+    spread = to_float_or_none(snapshot.get("spread"))
+    if spread is None and best_bid is not None and best_ask is not None:
+        spread = best_ask - best_bid
+    price = to_float_or_none(
+        snapshot.get("price")
+        or snapshot.get("current_price")
+        or snapshot.get("last_trade_price")
+        or midpoint
+    )
+    return {
+        "market_id": snapshot.get("market_id") or snapshot.get("market_key"),
+        "platform": venue,
+        "price": price,
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "midpoint": midpoint,
+        "spread": spread,
+        "depth_top5": to_float_or_none(snapshot.get("depth_top5")) or 0.0,
+    }
+
+
 def _sum_trades_volume(trades_json: dict[str, Any]) -> float | None:
     trades = trades_json.get("trades") if isinstance(trades_json, dict) else []
     if not isinstance(trades, list) or not trades:

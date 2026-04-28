@@ -60,6 +60,44 @@ def get_market_context(market_key: str | None, snapshots: list[dict]) -> dict | 
     return None
 
 
+def build_structured_input(snapshot: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(snapshot.get("claude_input"), dict):
+        claude_input = snapshot["claude_input"]
+        if {"primary_trades", "review_candidates", "reasoning_context"}.issubset(claude_input):
+            return claude_input
+    if {"primary_trades", "review_candidates", "reasoning_context"}.issubset(snapshot):
+        return {
+            "primary_trades": snapshot.get("primary_trades", []),
+            "review_candidates": snapshot.get("review_candidates", []),
+            "reasoning_context": snapshot.get("reasoning_context", []),
+        }
+    intel = snapshot.get("intelligence", {})
+    lag_signals = sort_lag_signals(intel.get("lag_signals", []))
+    review_candidates = sorted(
+        intel.get("review_candidates", []),
+        key=lambda s: s.get("relationship_score", 0.0),
+        reverse=True,
+    )
+    return {
+        "primary_trades": lag_signals,
+        "review_candidates": review_candidates,
+        "reasoning_context": [
+            {
+                "type": "execution_intelligence_constraint",
+                "message": (
+                    "Vardr ranks execution opportunities from leader-lag divergence, "
+                    "relationship direction, liquidity, and execution risk; it does "
+                    "not predict event outcomes."
+                ),
+            },
+            {
+                "type": "causality_guardrail",
+                "message": "Do not promote review candidates or speculative correlations to primary trades.",
+            },
+        ],
+    }
+
+
 def build_prompt(snapshot: dict[str, Any]) -> str:
     intel = snapshot.get("intelligence", {})
     lag_signals = sort_lag_signals(intel.get("lag_signals", []))
@@ -77,6 +115,10 @@ def build_prompt(snapshot: dict[str, Any]) -> str:
 
     lines.append("=== SYSTEM INSTRUCTION ===")
     lines.append(LLM_INSTRUCTION)
+    lines.append("")
+
+    lines.append("=== STRUCTURED CLAUDE INPUT ===")
+    lines.append(json.dumps(build_structured_input(snapshot), indent=2, sort_keys=True))
     lines.append("")
 
     lines.append("=== PRIMARY TRADE IDEAS (lag_signals) ===")

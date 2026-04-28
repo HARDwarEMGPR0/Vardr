@@ -116,6 +116,37 @@ def compute_execution_risk(
     return execution_risk_index(enriched, divergence_stress=divergence_stress, churn=churn)["execution_risk_index"]
 
 
+def compute_execution_risk_details(
+    snapshot: dict[str, Any],
+    venue: str | None = None,
+    divergence_stress: float = 0.0,
+    churn: float | None = None,
+) -> dict[str, Any]:
+    """Return product-facing execution risk fields.
+
+    Existing resolver code uses ``execution_risk_index`` and ``regime``. The
+    execution-intelligence API exposes the same scalar with the claim-level
+    names ``risk_score`` and ``risk_label``.
+    """
+
+    enriched = dict(snapshot)
+    if venue:
+        enriched["venue"] = venue
+    result = execution_risk_index(enriched, divergence_stress=divergence_stress, churn=churn)
+    risk_score = result["execution_risk_index"]
+    if risk_score < 0.33:
+        risk_label = "LOW"
+    elif risk_score < 0.66:
+        risk_label = "MEDIUM"
+    else:
+        risk_label = "HIGH"
+    return {
+        "risk_score": risk_score,
+        "risk_label": risk_label,
+        "drivers": result["drivers"],
+    }
+
+
 def compute_regime(
     execution_risk: float,
 ) -> str:

@@ -37,7 +37,7 @@ def _fetch_snapshot_command(args: argparse.Namespace) -> list[str]:
     ]
     if args.vardr_leader_api_url:
         command.extend(["--vardr-leader-api-url", args.vardr_leader_api_url])
-    else:
+    elif args.leader_markets_json:
         command.extend(["--leader-markets-json", args.leader_markets_json])
     return command
 
@@ -99,10 +99,6 @@ def call_claude(prompt: str, model: str) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    if not args.vardr_leader_api_url and not args.leader_markets_json:
-        sys.stderr.write("Error: provide --vardr-leader-api-url or --leader-markets-json.\n")
-        return 2
-
     fetch_code = run_fetch_snapshot(args)
     if fetch_code != 0:
         return fetch_code

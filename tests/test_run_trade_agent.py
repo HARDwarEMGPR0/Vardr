@@ -23,11 +23,21 @@ def _snapshot_json() -> str:
     )
 
 
-def test_missing_leader_source_exits_clearly(capsys) -> None:
-    code = runner.main(["--no-claude"])
+def test_default_leader_source_is_vardr1(monkeypatch, tmp_path) -> None:
+    snapshot_out = tmp_path / "latest_snapshot.json"
 
-    assert code != 0
-    assert "provide --vardr-leader-api-url or --leader-markets-json" in capsys.readouterr().err
+    def fake_run(*args, **kwargs):
+        command = args[0]
+        assert "--leader-markets-json" not in command
+        assert "--vardr-leader-api-url" not in command
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout=_snapshot_json(), stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    monkeypatch.setattr(runner, "build_prompt", lambda snapshot: "PROMPT")
+
+    code = runner.main(["--snapshot-out", str(snapshot_out), "--no-claude"])
+
+    assert code == 0
 
 
 def test_no_claude_prints_prompt(monkeypatch, tmp_path, capsys) -> None:

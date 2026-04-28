@@ -12,6 +12,17 @@ from market_fetcher.intelligence import (
     score_market_relationship,
 )
 from market_fetcher.leader_markets import load_leader_markets, load_leader_markets_from_vardr_api
+import market_fetcher.lag_candidates as lag_candidates_module
+from market_fetcher.lag_candidates import (
+    build_lag_candidates,
+    build_lag_candidates_debug,
+    build_lag_candidates_with_metadata,
+    load_local_polymarket_universe_with_metadata,
+)
+from market_fetcher.vardr1_client import fetch_vardr1_leader_markets
+from market_fetcher.vardr1_client import map_vardr1_market_to_leader
+from src.normalize import normalize_execution_market, normalize_kalshi_market
+from src.scoring import compute_execution_risk_details
 
 
 def _market(title, spread, depth_top5, mid, market_key="key-1"):
@@ -60,6 +71,86 @@ def test_find_opportunities_skips_missing_fields():
         {"title": "No mid", "market_key": "c", "spread": 0.005, "depth_top5": 100_000},
     ]
     assert find_opportunities(markets) == []
+
+
+def test_normalize_execution_market_uses_common_schema_for_polymarket():
+    normalized = normalize_execution_market(
+        {
+            "venue": "polymarket",
+            "market_key": "pm-1",
+            "last_trade_price": 0.51,
+            "best_yes_bid": 0.50,
+            "best_yes_ask": 0.54,
+            "mid": 0.52,
+            "spread": 0.04,
+            "depth_top5": 1200,
+        }
+    )
+
+    assert normalized == {
+        "market_id": "pm-1",
+        "platform": "polymarket",
+        "price": 0.51,
+        "best_bid": 0.5,
+        "best_ask": 0.54,
+        "midpoint": 0.52,
+        "spread": 0.04,
+        "depth_top5": 1200.0,
+    }
+
+
+def test_normalize_execution_market_reconstructs_kalshi_yes_ask_from_no_bid():
+    kalshi = normalize_kalshi_market(
+        "KX.TEST",
+        {"title": "Will test happen?"},
+        {"orderbook": {"yes": [[45, 10]], "no": [[52, 12]]}},
+        {"trades": []},
+    )
+    normalized = normalize_execution_market(kalshi)
+
+    assert normalized["market_id"] == "KX.TEST"
+    assert normalized["platform"] == "kalshi"
+    assert normalized["best_bid"] == 45.0
+    assert normalized["best_ask"] == 48.0
+    assert normalized["midpoint"] == 46.5
+    assert normalized["spread"] == 3.0
+
+
+def test_compute_execution_risk_details_returns_product_label():
+    risk = compute_execution_risk_details({"venue": "polymarket", "spread": 0.20, "depth_top5": 0})
+
+    assert 0 <= risk["risk_score"] <= 1
+    assert risk["risk_label"] in {"LOW", "MEDIUM", "HIGH"}
+    assert "drivers" in risk
+
+
+def test_vardr1_leader_mapping_outputs_standard_schema_and_score():
+    leader = map_vardr1_market_to_leader(
+        {
+            "market_id": "m1",
+            "market_title": "Will test happen?",
+            "current_price": 0.42,
+            "price_change_1h": 0.12,
+            "price_change_24h": -0.2,
+            "liquidity": 50_000,
+        }
+    )
+
+    assert leader["market_id"] == "m1"
+    assert leader["market_title"] == "Will test happen?"
+    assert leader["current_price"] == 0.42
+    assert leader["price_change_1h"] == 0.12
+    assert leader["price_change_24h"] == -0.2
+    assert leader["leader_score"] > 0
+
+
+def test_lag_similarity_uses_text_vector_beyond_token_overlap():
+    leader = {"title": "Will the Federal Reserve cut interest rates by June 2026?"}
+    related = {"title": "Fed rate reduction before June 2026?"}
+
+    score = lag_candidates_module._similarity_score(leader, related)
+
+    assert score > 0
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +565,676 @@ def test_vardr_api_loader_handles_failures_safely(monkeypatch):
     assert load_leader_markets_from_vardr_api("http://localhost:8000/leader-markets") == []
 
 
+def test_vardr1_client_fetches_suspicious_markets_endpoint(monkeypatch):
+    calls = []
+
+    class Response:
+        status_code = 200
+        text = (
+            '{"data":[{"platform":"polymarket","market_id":"0x0189df05",'
+            '"market_title":"Will Japan win the 2026 FIFA World Cup?",'
+            '"current_price":0.021,"price_change_1h":-0.958,'
+            '"price_change_24h":-0.9579999999648221,"leader_score":11.38849225268966}]}'
+        )
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {
+                        "platform": "polymarket",
+                        "market_id": "0x0189df05",
+                        "market_title": "Will Japan win the 2026 FIFA World Cup?",
+                        "current_price": 0.021,
+                        "price_change_1h": -0.958,
+                        "price_change_24h": -0.9579999999648221,
+                        "recent_volume": 145476.8280440001,
+                        "leader_score": 11.38849225268966,
+                    }
+                ]
+            }
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr("market_fetcher.vardr1_client.requests.get", fake_get)
+    leaders = fetch_vardr1_leader_markets(base_url="http://localhost:9002 ", window="24h", limit=25)
+
+    assert calls[0][0] == "http://localhost:9002/api/suspicious-markets"
+    assert calls[0][1]["params"] == {"window": "24h", "limit": 25}
+    assert leaders[0]["title"] == "Will Japan win the 2026 FIFA World Cup?"
+    assert leaders[0]["market_key"] == "0x0189df05"
+    assert leaders[0]["computed_mid_delta"] == -0.9579999999648221
+    assert leaders[0]["one_hour_price_change"] == -0.958
+    assert leaders[0]["one_day_price_change"] == -0.9579999999648221
+    assert leaders[0]["mid"] == 0.021
+    assert leaders[0]["source"] == "vardr1"
+    assert leaders[0]["reason"] == 11.38849225268966
+
+
+def test_lag_universe_loader_prefers_vardr1_parquet(monkeypatch, tmp_path):
+    import pandas as pd
+
+    parquet_path = tmp_path / "polymarket_markets.parquet"
+    pd.DataFrame(
+        [
+            {
+                "conditionid": "0xactive",
+                "question": "Will Bitcoin rally in 2026?",
+                "slug": "bitcoin-rally",
+                "active": True,
+                "closed": False,
+                "archived": False,
+                "lasttradeprice": 0.42,
+                "onehourpricechange": 0.03,
+                "onedaypricechange": 0.07,
+                "volume24hr": 1234.0,
+                "liquiditynum": 5678.0,
+            },
+            {
+                "conditionid": "0xclosed",
+                "question": "Closed market",
+                "slug": "closed-market",
+                "active": True,
+                "closed": True,
+                "archived": False,
+            },
+        ]
+    ).to_parquet(parquet_path)
+
+    monkeypatch.setenv("VARDR1_MARKETS_PATH", str(parquet_path))
+
+    markets, metadata = load_local_polymarket_universe_with_metadata(tmp_path)
+
+    assert metadata["source"] == "vardr1_parquet"
+    assert metadata["source_path"] == str(parquet_path)
+    assert metadata["raw_row_count"] == 2
+    assert metadata["row_count"] == 1
+    assert len(markets) == 1
+    assert markets[0]["market_id"] == "0xactive"
+    assert markets[0]["market_key"] == "0xactive"
+    assert markets[0]["market_title"] == "Will Bitcoin rally in 2026?"
+    assert markets[0]["current_price"] == 0.42
+
+
+def test_lag_universe_loader_falls_back_to_csv(monkeypatch, tmp_path):
+    csv_path = tmp_path / "polymarket_markets.csv"
+    csv_path.write_text(
+        "market_id,market_title,current_price,bestbid,bestask,active,closed,price_change_1h,price_change_24h,volume24hr,liquiditynum\n"
+        "m1,Will CSV market happen?,0.45,0.44,0.46,True,False,0.03,0.07,1234,5678\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VARDR1_MARKETS_PATH", str(tmp_path / "missing.parquet"))
+    monkeypatch.setenv("VARDR_MARKETS_CSV_PATH", str(csv_path))
+
+    markets, metadata = load_local_polymarket_universe_with_metadata(tmp_path)
+
+    assert len(markets) == 1
+    assert markets[0]["market_key"] == "m1"
+    assert metadata["source"] == "csv"
+    assert metadata["source_path"] == str(csv_path)
+    assert markets[0]["one_hour_price_change"] == 0.03
+    assert markets[0]["one_day_price_change"] == 0.07
+    assert markets[0]["volume_proxy"] == 1234.0
+    assert markets[0]["liquidity_proxy"] == 5678.0
+
+
+def test_lag_candidates_world_cup_winner_vs_winner_is_same_option_set():
+    leader = {
+        "title": "Will Japan win the 2026 FIFA World Cup?",
+        "market_key": "japan-world-cup",
+        "one_hour_price_change": -0.9,
+        "one_day_price_change": -0.9,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "switzerland-world-cup",
+        "title": "Will Switzerland win the 2026 FIFA World Cup?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+    }
+
+    candidates = build_lag_candidates(
+        [leader], [related], min_similarity=0, min_divergence=0, include_review_only=True, max_abs_leader_move=1.0
+    )
+    assert len(candidates) == 1
+    assert candidates[0]["relationship_type"] == "SAME_OPTION_SET_NEGATIVE_CORRELATION"
+    assert candidates[0]["expected_correlation_direction"] == "negative"
+    assert candidates[0]["option_set_key"] is not None
+
+    debug = build_lag_candidates_debug([leader], [related], min_similarity=0, min_divergence=0, max_abs_leader_move=1.0)
+    candidate = debug[0]["top_related_candidates_before_threshold_filtering"][0]
+    assert candidate["relationship_type"] == "SAME_OPTION_SET_NEGATIVE_CORRELATION"
+    assert candidate["rejected_reason"] is None
+
+
+def test_lag_candidates_world_cup_option_set_valid_and_group_winner_rejected():
+    leader = {
+        "title": "Will Japan win the 2026 FIFA World Cup?",
+        "market_key": "japan-world-cup",
+        "one_hour_price_change": -0.9,
+        "one_day_price_change": -0.9,
+    }
+    universe = [
+        {
+            "venue": "polymarket",
+            "market_key": "brazil-world-cup",
+            "title": "Will Brazil win the 2026 FIFA World Cup?",
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+        },
+        {
+            "venue": "polymarket",
+            "market_key": "france-world-cup",
+            "title": "Will France win the 2026 FIFA World Cup?",
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+        },
+        {
+            "venue": "polymarket",
+            "market_key": "england-world-cup",
+            "title": "Will England win the 2026 FIFA World Cup?",
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+        },
+        {
+            "venue": "polymarket",
+            "market_key": "japan-group-f",
+            "title": "Will Japan win Group F at the 2026 FIFA World Cup?",
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+        },
+    ]
+
+    candidates = build_lag_candidates(
+        [leader],
+        universe,
+        min_similarity=0,
+        min_divergence=0,
+        include_review_only=True,
+        max_abs_leader_move=1.0,
+        max_candidates_per_leader_output=10,
+        max_candidates_per_event_output=10,
+        min_related_abs_move_24h=0,
+        min_similarity_for_trade=0,
+    )
+    candidate_ids = {candidate["related_market_id"] for candidate in candidates}
+    assert {"brazil-world-cup", "france-world-cup", "england-world-cup"}.issubset(candidate_ids)
+    assert "japan-group-f" not in candidate_ids
+    for candidate in candidates:
+        if candidate["related_market_id"] in {"brazil-world-cup", "france-world-cup", "england-world-cup"}:
+            assert candidate["relationship_type"] == "SAME_OPTION_SET_NEGATIVE_CORRELATION"
+            assert candidate["expected_correlation_direction"] == "negative"
+
+    debug = build_lag_candidates_debug([leader], universe, min_similarity=0, min_divergence=0, max_abs_leader_move=1.0)
+    by_title = {
+        candidate["related_market_title"]: candidate
+        for candidate in debug[0]["top_related_candidates_before_threshold_filtering"]
+    }
+    group_f = by_title["Will Japan win Group F at the 2026 FIFA World Cup?"]
+    assert group_f["relationship_type"] == "SAME_EVENT_OUTCOME"
+    assert "SAME_EVENT_OUTCOME" in group_f["rejected_reason"]
+
+
+def test_lag_candidates_skips_resolved_or_bad_tick_leaders():
+    leaders = [
+        {
+            "title": "Will Glenn Youngkin win the 2028 US President?",
+            "market_key": "youngkin-bad-tick",
+            "one_hour_price_change": 0.981,
+            "one_day_price_change": 0.981,
+        },
+        {
+            "title": "Will Japan win the 2026 FIFA World Cup?",
+            "market_key": "japan-bad-tick",
+            "one_hour_price_change": -0.958,
+            "one_day_price_change": -0.958,
+        },
+    ]
+    universe = [
+        {
+            "venue": "polymarket",
+            "market_key": "republicans-president",
+            "title": "Will Republicans win the 2028 US President?",
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+        },
+        {
+            "venue": "polymarket",
+            "market_key": "asia-world-cup",
+            "title": "Will Asia win the 2026 FIFA World Cup?",
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+        },
+    ]
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        leaders,
+        universe,
+        min_similarity=0,
+        min_divergence=0,
+        max_leaders_evaluated=10,
+    )
+
+    assert candidates == []
+    assert meta["resolved_or_bad_tick_leaders_skipped"] == 2
+    assert meta["skip_reasons_count"]["resolved_or_bad_tick_candidate"] == 2
+    assert len(meta["resolved_or_bad_tick_skip_examples"]) == 2
+
+    debug = build_lag_candidates_debug(leaders, universe, leader_limit=2, min_similarity=0, min_divergence=0)
+    assert [row["resolved_or_bad_tick_candidate"] for row in debug] == [True, True]
+    assert [row["skip_reason"] for row in debug] == [
+        "resolved_or_bad_tick_candidate",
+        "resolved_or_bad_tick_candidate",
+    ]
+
+
+def test_lag_candidates_same_option_set_subset_positive_party_and_region():
+    cases = [
+        (
+            "Will Glenn Youngkin win the 2028 US President?",
+            "Will Republicans win the 2028 US President?",
+            "youngkin",
+            "republicans",
+        ),
+        (
+            "Will Marco Rubio win the 2028 US President?",
+            "Will Republicans win the 2028 US President?",
+            "rubio",
+            "republicans",
+        ),
+        (
+            "Will AOC win the 2028 US President?",
+            "Will Democrats win the 2028 US President?",
+            "aoc",
+            "democrats",
+        ),
+        (
+            "Will Gretchen Whitmer win the 2028 US President?",
+            "Will Democrats win the 2028 US President?",
+            "whitmer",
+            "democrats",
+        ),
+        (
+            "Will Japan win the 2026 FIFA World Cup?",
+            "Will Asia win the 2026 FIFA World Cup?",
+            "japan",
+            "asia",
+        ),
+    ]
+
+    for leader_title, related_title, leader_key, related_key in cases:
+        leader = {
+            "title": leader_title,
+            "market_key": leader_key,
+            "one_hour_price_change": 0.3,
+            "one_day_price_change": 0.4,
+        }
+        related = {
+            "venue": "polymarket",
+            "market_key": related_key,
+            "title": related_title,
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+        }
+
+        candidates = build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0, include_review_only=True)
+
+        assert len(candidates) == 1
+        candidate = candidates[0]
+        assert candidate["relationship_type"] == "SAME_OPTION_SET_POSITIVE_CORRELATION"
+        assert candidate["expected_correlation_direction"] == "positive"
+        assert candidate["subset_relationship"] is True
+        assert candidate["subset_relationship_reason"]
+        assert candidate["resolved_or_bad_tick_candidate"] is False
+        assert candidate["suggested_trade_direction"] != "buy_no_related"
+
+
+def test_lag_candidates_same_option_set_competitors_remain_negative():
+    cases = [
+        (
+            "Will Japan win the 2026 FIFA World Cup?",
+            "Will Brazil win the 2026 FIFA World Cup?",
+            "japan",
+            "brazil",
+        ),
+        (
+            "Will Japan win the 2026 FIFA World Cup?",
+            "Will France win the 2026 FIFA World Cup?",
+            "japan",
+            "france",
+        ),
+        (
+            "Will Glenn Youngkin win the 2028 US President?",
+            "Will Democrats win the 2028 US President?",
+            "youngkin",
+            "democrats",
+        ),
+        (
+            "Will Marco Rubio win the 2028 US President?",
+            "Will Democrats win the 2028 US President?",
+            "rubio",
+            "democrats",
+        ),
+        (
+            "Will AOC win the 2028 US President?",
+            "Will Republicans win the 2028 US President?",
+            "aoc",
+            "republicans",
+        ),
+    ]
+
+    for leader_title, related_title, leader_key, related_key in cases:
+        leader = {
+            "title": leader_title,
+            "market_key": leader_key,
+            "one_hour_price_change": 0.3,
+            "one_day_price_change": 0.4,
+        }
+        related = {
+            "venue": "polymarket",
+            "market_key": related_key,
+            "title": related_title,
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+        }
+
+        candidates = build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0, include_review_only=True)
+
+        assert len(candidates) == 1
+        candidate = candidates[0]
+        assert candidate["relationship_type"] == "SAME_OPTION_SET_NEGATIVE_CORRELATION"
+        assert candidate["expected_correlation_direction"] == "negative"
+        assert candidate["subset_relationship"] is False
+        assert candidate["suggested_trade_direction"] == "review_only"
+        assert candidate["low_related_activity"] is True
+        assert candidate["tradable_signal"] is False
+
+
+def test_lag_candidates_subset_down_move_is_not_treated_as_competitor_negative():
+    leader = {
+        "title": "Will Japan win the 2026 FIFA World Cup?",
+        "market_key": "japan",
+        "one_hour_price_change": -0.3,
+        "one_day_price_change": -0.4,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "asia",
+        "title": "Will Asia win the 2026 FIFA World Cup?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+    }
+
+    candidates = build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0, include_review_only=True)
+
+    assert len(candidates) == 1
+    assert candidates[0]["relationship_type"] == "SAME_OPTION_SET_POSITIVE_CORRELATION"
+    assert candidates[0]["expected_correlation_direction"] == "positive"
+    assert candidates[0]["suggested_trade_direction"] != "buy_yes_related"
+
+
+def test_lag_candidates_same_party_positive_trade_direction_is_not_buy_no():
+    leader = {
+        "title": "Will Marco Rubio win the 2028 US President?",
+        "market_key": "rubio",
+        "one_hour_price_change": 0.3,
+        "one_day_price_change": 0.4,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "republicans",
+        "title": "Will Republicans win the 2028 US President?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.02,
+    }
+
+    candidates = build_lag_candidates(
+        [leader],
+        [related],
+        min_similarity=0,
+        min_divergence=0,
+        min_similarity_for_trade=0,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["relationship_type"] == "SAME_OPTION_SET_POSITIVE_CORRELATION"
+    assert candidates[0]["suggested_trade_direction"] == "buy_yes_related"
+    assert candidates[0]["suggested_trade_direction"] != "buy_no_related"
+
+
+def test_lag_candidates_execution_filters_allow_only_tradable_buy_actions():
+    leader = {
+        "title": "Will a Gaza ceasefire deal happen by June 2026?",
+        "market_key": "gaza-ceasefire",
+        "one_hour_price_change": 0.4,
+        "one_day_price_change": 0.5,
+        "_lag_tokens": {"gaza", "ceasefire", "deal", "june"},
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "gaza-hostages",
+        "title": "Will Gaza hostages be released by June 2026?",
+        "one_hour_price_change": 0.01,
+        "one_day_price_change": 0.02,
+        "_lag_tokens": {"gaza", "ceasefire", "deal", "june"},
+    }
+
+    candidates = build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0, include_review_only=True)
+
+    assert len(candidates) == 1
+    assert candidates[0]["suggested_trade_direction"] == "buy_yes_related"
+    assert candidates[0]["low_related_activity"] is False
+    assert candidates[0]["below_similarity_threshold"] is False
+    assert candidates[0]["tradable_signal"] is True
+
+
+def test_lag_candidates_low_related_activity_downgrades_trade_action():
+    leader = {
+        "title": "Will a Gaza ceasefire deal happen by June 2026?",
+        "market_key": "gaza-ceasefire",
+        "one_hour_price_change": 0.4,
+        "one_day_price_change": 0.5,
+        "_lag_tokens": {"gaza", "ceasefire", "deal", "june"},
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "gaza-hostages",
+        "title": "Will Gaza hostages be released by June 2026?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+        "_lag_tokens": {"gaza", "ceasefire", "deal", "june"},
+    }
+
+    candidates = build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0, include_review_only=True)
+
+    assert len(candidates) == 1
+    assert candidates[0]["suggested_trade_direction"] == "review_only"
+    assert candidates[0]["low_related_activity"] is True
+    assert candidates[0]["below_similarity_threshold"] is False
+    assert candidates[0]["tradable_signal"] is False
+
+
+def test_lag_candidates_zero_24h_leader_and_related_removed():
+    leader = {
+        "title": "Will a Gaza ceasefire deal happen by June 2026?",
+        "market_key": "gaza-ceasefire",
+        "one_hour_price_change": 0.4,
+        "one_day_price_change": 0.0,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "gaza-hostages",
+        "title": "Will Gaza hostages be released by June 2026?",
+        "one_hour_price_change": 0.1,
+        "one_day_price_change": 0.0,
+    }
+
+    assert build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0) == []
+
+
+def test_lag_candidates_exclude_duplicate_buckets():
+    leader = {
+        "title": "Will SBF be sentenced to 10-20 years?",
+        "market_key": "sbf-10-20",
+        "one_hour_price_change": 0.3,
+        "one_day_price_change": 0.3,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "sbf-20-30",
+        "title": "Will SBF be sentenced to 20-30 years?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+    }
+
+    assert build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0) == []
+    debug = build_lag_candidates_debug([leader], [related], min_similarity=0, min_divergence=0)
+    candidate = debug[0]["top_related_candidates_before_threshold_filtering"][0]
+    assert candidate["relationship_type"] == "DUPLICATE_BUCKET"
+    assert "DUPLICATE_BUCKET" in candidate["rejected_reason"]
+
+
+def test_lag_candidates_include_causally_linked_positive_lag():
+    leader = {
+        "title": "Will a Gaza ceasefire deal happen by June 2026?",
+        "market_key": "gaza-ceasefire",
+        "one_hour_price_change": 0.4,
+        "one_day_price_change": 0.5,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "gaza-hostages-released",
+        "title": "Will Gaza hostages be released by June 2026?",
+        "one_hour_price_change": 0.01,
+        "one_day_price_change": 0.02,
+    }
+
+    candidates = build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0, include_review_only=True)
+
+    assert len(candidates) == 1
+    assert candidates[0]["relationship_type"] == "CAUSALLY_LINKED"
+    assert candidates[0]["expected_correlation_direction"] == "positive"
+    assert candidates[0]["suggested_trade_direction"] == "review_only"
+    assert candidates[0]["below_similarity_threshold"] is True
+    assert candidates[0]["tradable_signal"] is False
+
+
+def test_lag_candidates_correlation_direction_negative():
+    leader = {
+        "title": "Will a Gaza ceasefire deal happen by June 2026?",
+        "market_key": "gaza-ceasefire",
+        "one_hour_price_change": 0.4,
+        "one_day_price_change": 0.5,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "gaza-sanctions",
+        "title": "Will Gaza sanctions happen by June 2026?",
+        "one_hour_price_change": 0.01,
+        "one_day_price_change": 0.02,
+    }
+
+    candidates = build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0, include_review_only=True)
+
+    assert len(candidates) == 1
+    assert candidates[0]["relationship_type"] == "CAUSALLY_LINKED"
+    assert candidates[0]["expected_correlation_direction"] == "negative"
+    assert candidates[0]["suggested_trade_direction"] == "review_only"
+    assert candidates[0]["below_similarity_threshold"] is True
+    assert candidates[0]["tradable_signal"] is False
+
+
+def test_lag_candidates_exploratory_allows_weak_correlated_candidates():
+    leader = {
+        "title": "Will Bitcoin hit 100k by end of 2026?",
+        "market_key": "btc-100k",
+        "one_hour_price_change": 0.2,
+        "one_day_price_change": 0.3,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "btc-etf",
+        "title": "Will Bitcoin ETF get approval by end of 2026?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+    }
+
+    assert build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0) == []
+    assert build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0, exploratory=True) == []
+    exploratory = build_lag_candidates(
+        [leader],
+        [related],
+        min_similarity=0,
+        min_divergence=0,
+        exploratory=True,
+        include_weak_similarity=True,
+        include_review_only=True,
+    )
+
+    assert len(exploratory) == 1
+    assert exploratory[0]["relationship_type"] == "CORRELATED_BUT_WEAK"
+    assert exploratory[0]["strong_match"] is False
+    assert exploratory[0]["exploratory_match"] is True
+
+
+def test_lag_candidates_reject_world_cup_winner_vs_halftime_performer_as_shared_event_only():
+    leader = {
+        "title": "Will Japan win the 2026 FIFA World Cup?",
+        "market_key": "japan-world-cup",
+        "one_hour_price_change": -0.9,
+        "one_day_price_change": -0.9,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "world-cup-halftime",
+        "title": "Will Taylor Swift perform at the 2026 World Cup halftime show?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+    }
+
+    assert build_lag_candidates(
+        [leader], [related], min_similarity=0, min_divergence=0, exploratory=True, max_abs_leader_move=1.0
+    ) == []
+    debug = build_lag_candidates_debug(
+        [leader], [related], min_similarity=0, min_divergence=0, exploratory=True, max_abs_leader_move=1.0
+    )
+    candidate = debug[0]["top_related_candidates_before_threshold_filtering"][0]
+    assert candidate["relationship_type"] == "SHARED_EVENT_ONLY"
+    assert "SHARED_EVENT_ONLY" in candidate["rejected_reason"]
+
+
+def test_lag_candidates_cross_role_same_entity_accepted_as_review_only():
+    leader = {
+        "title": "Will Ted Cruz win the 2028 Republican presidential nomination?",
+        "market_key": "ted-president",
+        "one_hour_price_change": -0.9,
+        "one_day_price_change": -0.9,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "ted-vp",
+        "title": "Will Ted Cruz be the 2028 Republican Vice-Presidential nominee?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+    }
+
+    candidates = build_lag_candidates(
+        [leader], [related], min_similarity=0, min_divergence=0, include_review_only=True, max_abs_leader_move=1.0
+    )
+    assert len(candidates) == 1
+    assert candidates[0]["relationship_type"] == "CROSS_ROLE_SAME_ENTITY"
+    assert candidates[0]["suggested_trade_direction"] == "review_only"
+
+    debug = build_lag_candidates_debug([leader], [related], min_similarity=0, min_divergence=0, max_abs_leader_move=1.0)
+    candidate = debug[0]["top_related_candidates_before_threshold_filtering"][0]
+    assert candidate["relationship_type"] == "CROSS_ROLE_SAME_ENTITY"
+    assert candidate["rejected_reason"] is None
+
+
 def test_lag_signals_from_external_leader_markets():
     leader = {
         "title": "Will Trump win the election?",
@@ -567,6 +1328,100 @@ def test_expected_direction_controls_opposite_action(monkeypatch):
     assert signals[0]["action"] == "buy_no_laggard"
 
 
+def test_lag_candidates_halftime_artist_vs_artist_is_same_option_set():
+    leader = {
+        "title": "Will Beyoncé perform at the 2026 World Cup halftime show?",
+        "market_key": "beyonce-halftime",
+        "one_hour_price_change": 0.3,
+        "one_day_price_change": 0.4,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "taylor-halftime",
+        "title": "Will Taylor Swift perform at the 2026 World Cup halftime show?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+    }
+
+    candidates = build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0, include_review_only=True)
+    assert len(candidates) == 1
+    assert candidates[0]["relationship_type"] == "SAME_OPTION_SET_NEGATIVE_CORRELATION"
+    assert candidates[0]["expected_correlation_direction"] == "negative"
+    assert candidates[0]["suggested_trade_direction"] == "review_only"
+    assert candidates[0]["low_related_activity"] is True
+    assert candidates[0]["tradable_signal"] is False
+
+
+def test_lag_candidates_japan_winner_vs_calvin_harris_halftime_rejected_as_shared_event_only():
+    leader = {
+        "title": "Will Japan win the 2026 FIFA World Cup?",
+        "market_key": "japan-world-cup",
+        "one_hour_price_change": 0.3,
+        "one_day_price_change": 0.4,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "calvin-halftime",
+        "title": "Will Calvin Harris perform at the 2026 World Cup halftime show?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+    }
+
+    assert build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0) == []
+    debug = build_lag_candidates_debug([leader], [related], min_similarity=0, min_divergence=0)
+    candidate = debug[0]["top_related_candidates_before_threshold_filtering"][0]
+    assert candidate["relationship_type"] == "SHARED_EVENT_ONLY"
+    assert "SHARED_EVENT_ONLY" in candidate["rejected_reason"]
+
+
+def test_lag_candidates_ted_cruz_presidential_vs_vp_is_cross_role_same_entity():
+    leader = {
+        "title": "Will Ted Cruz win the 2028 Republican presidential nomination?",
+        "market_key": "ted-president",
+        "one_hour_price_change": 0.3,
+        "one_day_price_change": 0.4,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "ted-vp",
+        "title": "Will Ted Cruz be the 2028 Republican Vice-Presidential nominee?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+    }
+
+    candidates = build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0, include_review_only=True)
+    assert len(candidates) == 1
+    c = candidates[0]
+    assert c["relationship_type"] == "CROSS_ROLE_SAME_ENTITY"
+    assert c["suggested_trade_direction"] == "review_only"
+    assert c["expected_correlation_direction"] == "unclear"
+
+
+def test_lag_candidates_world_cup_team_vs_team_is_same_option_set_not_causally_linked():
+    leader = {
+        "title": "Will Brazil win the 2026 FIFA World Cup?",
+        "market_key": "brazil-world-cup",
+        "one_hour_price_change": 0.3,
+        "one_day_price_change": 0.4,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "france-world-cup",
+        "title": "Will France win the 2026 FIFA World Cup?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+    }
+
+    candidates = build_lag_candidates([leader], [related], min_similarity=0, min_divergence=0, include_review_only=True)
+    assert len(candidates) == 1
+    assert candidates[0]["relationship_type"] == "SAME_OPTION_SET_NEGATIVE_CORRELATION"
+    assert candidates[0]["relationship_type"] != "CAUSALLY_LINKED"
+    assert candidates[0]["expected_correlation_direction"] == "negative"
+    assert candidates[0]["suggested_trade_direction"] == "review_only"
+    assert candidates[0]["low_related_activity"] is True
+    assert candidates[0]["tradable_signal"] is False
+
+
 def test_signal_strength_is_numeric():
     leader, laggard = _lag_pair()
     signals = detect_lagging_correlated_markets([laggard], [leader])
@@ -574,6 +1429,559 @@ def test_signal_strength_is_numeric():
     strength = signals[0]["signal_strength"]
     assert isinstance(strength, (int, float))
     assert strength > 0
+
+
+def test_build_lag_candidates_with_metadata_returns_metadata():
+    leader = {
+        "title": "Will a Gaza ceasefire deal happen by June 2026?",
+        "market_key": "gaza-ceasefire",
+        "one_hour_price_change": 0.4,
+        "one_day_price_change": 0.5,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "gaza-hostages",
+        "title": "Will Gaza hostages be released by June 2026?",
+        "one_hour_price_change": 0.01,
+        "one_day_price_change": 0.02,
+    }
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        [leader], [related], min_similarity=0, min_divergence=0, max_leaders_evaluated=10, include_review_only=True
+    )
+
+    assert len(candidates) == 1
+    assert meta["leaders_fetched"] == 1
+    assert meta["leaders_evaluated"] == 1
+    assert meta["remaining_leaders_not_evaluated"] == 0
+    assert meta["leaders_skipped"] == 0
+    assert meta["valid_candidates_found"] == 1
+    assert meta["partial_results_due_to_timeout"] is False
+
+
+def test_lag_candidates_evaluates_minimum_leaders_before_timeout(monkeypatch):
+    leaders = [
+        {
+            "title": f"Leader {idx}",
+            "market_key": f"leader-{idx}",
+            "one_hour_price_change": 0.1,
+            "one_day_price_change": 0.1,
+        }
+        for idx in range(10)
+    ]
+
+    ticks = iter([idx * 0.2 for idx in range(20)])
+    monkeypatch.setattr(lag_candidates_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(lag_candidates_module, "_leader_candidate_evaluations", lambda *args, **kwargs: [])
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        leaders,
+        [],
+        max_leaders_evaluated=10,
+        timeout_seconds=0.1,
+        min_leaders_before_timeout=5,
+    )
+
+    assert candidates == []
+    assert meta["partial_results_due_to_timeout"] is True
+    assert meta["leaders_evaluated"] == 5
+    assert meta["remaining_leaders_not_evaluated"] == 5
+    assert meta["leaders_evaluated_before_timeout"] == 5
+    assert meta["elapsed_time_total"] > 0
+
+
+def test_lag_candidates_evaluates_minimum_leaders_before_limit_short_circuit(monkeypatch):
+    leaders = [
+        {
+            "title": f"Leader {idx}",
+            "market_key": f"leader-{idx}",
+            "one_hour_price_change": 0.1,
+            "one_day_price_change": 0.1,
+        }
+        for idx in range(10)
+    ]
+
+    def fake_evaluations(leader, *_args, **_kwargs):
+        return [
+            {
+                "leader_market_title": leader["title"],
+                "leader_market_id": leader["market_key"],
+                "related_market_title": f"Related {leader['market_key']}",
+                "related_market_id": f"related-{leader['market_key']}",
+                "relationship_type": "SAME_OPTION_SET_NEGATIVE_CORRELATION",
+                "expected_correlation_direction": "negative",
+                "divergence_score": 1.0,
+                "rejected_reason": None,
+                "excluded_as_self_market": False,
+                "excluded_as_duplicate_bucket": False,
+            }
+        ]
+
+    monkeypatch.setattr(lag_candidates_module, "_leader_candidate_evaluations", fake_evaluations)
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        leaders,
+        [],
+        limit=1,
+        max_leaders_evaluated=10,
+        min_leaders_before_timeout=5,
+        timeout_seconds=60,
+        include_review_only=True,
+    )
+
+    assert len(candidates) == 1
+    assert meta["leaders_evaluated"] == 5
+    assert meta["partial_results_due_to_timeout"] is False
+
+
+def test_lag_candidates_output_caps_each_leader_and_continues(monkeypatch):
+    leaders = [
+        {
+            "title": f"Leader {idx}",
+            "market_key": f"leader-{idx}",
+            "one_hour_price_change": 0.1,
+            "one_day_price_change": 0.1,
+        }
+        for idx in range(3)
+    ]
+
+    def fake_evaluations(leader, *_args, **_kwargs):
+        return [
+            {
+                "leader_market_title": leader["title"],
+                "leader_market_id": leader["market_key"],
+                "related_market_title": f"Related {leader['market_key']}-{idx}",
+                "related_market_id": f"related-{leader['market_key']}-{idx}",
+                "relationship_type": "CAUSALLY_LINKED",
+                "expected_correlation_direction": "positive",
+                "divergence_score": 1.0 - (idx / 10),
+                "tradable_signal": True,
+                "rejected_reason": None,
+                "excluded_as_self_market": False,
+                "excluded_as_duplicate_bucket": False,
+            }
+            for idx in range(4)
+        ]
+
+    monkeypatch.setattr(lag_candidates_module, "_leader_candidate_evaluations", fake_evaluations)
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        leaders,
+        [],
+        limit=5,
+        max_leaders_evaluated=3,
+        max_candidates_per_leader_output=2,
+        min_leaders_before_timeout=0,
+    )
+
+    counts_by_leader = {}
+    for candidate in candidates:
+        counts_by_leader[candidate["leader_market_id"]] = counts_by_leader.get(candidate["leader_market_id"], 0) + 1
+
+    assert len(candidates) == 5
+    assert max(counts_by_leader.values()) <= 2
+    assert len(counts_by_leader) >= 3
+    assert meta["candidates_suppressed_by_leader_cap"] >= 3
+    assert meta["max_candidates_per_leader_output"] == 2
+
+
+def test_lag_candidates_output_caps_each_event_and_continues(monkeypatch):
+    leaders = [
+        {
+            "title": f"Election Leader {idx}",
+            "market_key": f"leader-{idx}",
+            "one_hour_price_change": 0.1,
+            "one_day_price_change": 0.1,
+        }
+        for idx in range(4)
+    ]
+
+    def fake_evaluations(leader, *_args, **_kwargs):
+        return [
+            {
+                "leader_market_title": leader["title"],
+                "leader_market_id": leader["market_key"],
+                "related_market_title": f"Related {leader['market_key']}",
+                "related_market_id": f"related-{leader['market_key']}",
+                "relationship_type": "SAME_OPTION_SET_NEGATIVE_CORRELATION",
+                "expected_correlation_direction": "negative",
+                "divergence_score": 1.0,
+                "tradable_signal": True,
+                "option_set_key": "('us presidential election', '2028', 'winner')",
+                "rejected_reason": None,
+                "excluded_as_self_market": False,
+                "excluded_as_duplicate_bucket": False,
+            }
+        ]
+
+    monkeypatch.setattr(lag_candidates_module, "_leader_candidate_evaluations", fake_evaluations)
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        leaders,
+        [],
+        limit=10,
+        max_leaders_evaluated=4,
+        max_candidates_per_leader_output=5,
+        max_candidates_per_event_output=2,
+        min_leaders_before_timeout=0,
+    )
+
+    assert len(candidates) == 2
+    assert meta["candidates_suppressed_by_event_cap"] == 2
+    assert meta["events_represented_count"] == 1
+    assert meta["unique_leaders_in_output"] == 2
+    assert meta["tradable_signals_count"] == 2
+    assert meta["max_candidates_per_event_output"] == 2
+
+
+def test_lag_candidates_leader_cap_allows_extra_slots_only_for_tradable(monkeypatch):
+    leader = {
+        "title": "Leader",
+        "market_key": "leader",
+        "one_hour_price_change": 0.1,
+        "one_day_price_change": 0.1,
+    }
+
+    def fake_evaluations(_leader, *_args, **_kwargs):
+        rows = []
+        for idx, tradable in enumerate([False, False, True, True, False]):
+            rows.append(
+                {
+                    "leader_market_title": "Leader",
+                    "leader_market_id": "leader",
+                    "related_market_title": f"Related {idx}",
+                    "related_market_id": f"related-{idx}",
+                    "relationship_type": "CAUSALLY_LINKED",
+                    "expected_correlation_direction": "positive",
+                    "divergence_score": 1.0 - (idx / 10),
+                    "tradable_signal": tradable,
+                    "rejected_reason": None,
+                    "excluded_as_self_market": False,
+                    "excluded_as_duplicate_bucket": False,
+                }
+            )
+        return rows
+
+    monkeypatch.setattr(lag_candidates_module, "_leader_candidate_evaluations", fake_evaluations)
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        [leader],
+        [],
+        limit=10,
+        max_leaders_evaluated=1,
+        include_review_only=True,
+        min_leaders_before_timeout=0,
+    )
+
+    assert len(candidates) == 4
+    assert [candidate["related_market_id"] for candidate in candidates] == [
+        "related-0",
+        "related-1",
+        "related-2",
+        "related-3",
+    ]
+    assert sum(1 for candidate in candidates if not candidate["tradable_signal"]) == 2
+    assert meta["max_candidates_per_leader_output"] == 4
+    assert meta["candidates_suppressed_by_leader_cap"] == 1
+
+
+def test_lag_candidates_prefilters_low_quality_leaders_before_evaluation(monkeypatch):
+    leaders = [
+        {
+            "title": "Inconsistent spike leader",
+            "market_key": "inconsistent",
+            "one_hour_price_change": 0.6,
+            "one_day_price_change": 0.01,
+        },
+        {
+            "title": "Low information leader",
+            "market_key": "low-info",
+            "one_hour_price_change": 0.01,
+            "one_day_price_change": 0.005,
+        },
+        {
+            "title": "Near boundary leader",
+            "market_key": "boundary",
+            "one_hour_price_change": 0.1,
+            "one_day_price_change": 0.1,
+            "current_price": 0.99,
+        },
+    ]
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("prefiltered leaders should not be evaluated")
+
+    monkeypatch.setattr(lag_candidates_module, "_leader_candidate_evaluations", fail_if_called)
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        leaders,
+        [],
+        limit=10,
+        max_leaders_evaluated=3,
+        min_leaders_before_timeout=0,
+    )
+
+    assert candidates == []
+    assert meta["leaders_filtered_before_evaluation"] == 3
+    assert meta["leader_prefilter_skip_reasons_count"] == {
+        "inconsistent_spike_candidate": 1,
+        "low_information_leader": 1,
+        "near_boundary_probability": 1,
+    }
+    assert meta["leaders_skipped"] == 3
+
+
+def test_lag_candidates_metadata_counts_output_quality(monkeypatch):
+    leaders = [
+        {
+            "title": "World Cup leader",
+            "market_key": "wc-leader",
+            "one_hour_price_change": 0.1,
+            "one_day_price_change": 0.1,
+        },
+        {
+            "title": "Election leader",
+            "market_key": "election-leader",
+            "one_hour_price_change": 0.1,
+            "one_day_price_change": 0.1,
+        },
+    ]
+
+    def fake_evaluations(leader, *_args, **_kwargs):
+        if leader["market_key"] == "wc-leader":
+            option_set_key = "('fifa world cup', '2026', 'winner')"
+        else:
+            option_set_key = "('us presidential election', '2028', 'winner')"
+        return [
+            {
+                "leader_market_title": leader["title"],
+                "leader_market_id": leader["market_key"],
+                "related_market_title": f"Tradable {leader['market_key']}",
+                "related_market_id": f"tradable-{leader['market_key']}",
+                "relationship_type": "SAME_OPTION_SET_NEGATIVE_CORRELATION",
+                "expected_correlation_direction": "negative",
+                "divergence_score": 1.0,
+                "tradable_signal": True,
+                "option_set_key": option_set_key,
+                "rejected_reason": None,
+                "excluded_as_self_market": False,
+                "excluded_as_duplicate_bucket": False,
+            },
+            {
+                "leader_market_title": leader["title"],
+                "leader_market_id": leader["market_key"],
+                "related_market_title": f"Review {leader['market_key']}",
+                "related_market_id": f"review-{leader['market_key']}",
+                "relationship_type": "SAME_OPTION_SET_NEGATIVE_CORRELATION",
+                "expected_correlation_direction": "negative",
+                "divergence_score": 0.9,
+                "tradable_signal": False,
+                "option_set_key": option_set_key,
+                "rejected_reason": None,
+                "excluded_as_self_market": False,
+                "excluded_as_duplicate_bucket": False,
+            },
+        ]
+
+    monkeypatch.setattr(lag_candidates_module, "_leader_candidate_evaluations", fake_evaluations)
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        leaders,
+        [],
+        limit=10,
+        max_leaders_evaluated=2,
+        min_leaders_before_timeout=0,
+    )
+
+    assert len(candidates) == 2
+    assert meta["events_represented_count"] == 2
+    assert meta["unique_leaders_in_output"] == 2
+    assert meta["tradable_signals_count"] == 2
+    assert meta["non_tradable_filtered_count"] == 2
+
+
+def test_lag_candidates_default_suppresses_review_only_candidates():
+    leader = {
+        "title": "Will a Gaza ceasefire deal happen by June 2026?",
+        "market_key": "gaza-ceasefire",
+        "one_hour_price_change": 0.4,
+        "one_day_price_change": 0.5,
+        "_lag_tokens": {"gaza", "ceasefire", "deal", "june"},
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "gaza-hostages",
+        "title": "Will Gaza hostages be released by June 2026?",
+        "one_hour_price_change": 0.0,
+        "one_day_price_change": 0.0,
+        "_lag_tokens": {"gaza", "ceasefire", "deal", "june"},
+    }
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        [leader], [related], min_similarity=0, min_divergence=0
+    )
+
+    assert candidates == []
+    assert meta["review_only_candidates_suppressed"] == 1
+    assert meta["valid_candidates_found"] == 0
+
+
+def test_lag_candidates_default_bad_tick_threshold_skips_aoc_size_move():
+    leader = {
+        "title": "Will Alexandria Ocasio-Cortez win the 2028 US Presidential Election?",
+        "market_key": "aoc-2028",
+        "one_hour_price_change": 0.882,
+        "one_day_price_change": 0.882,
+    }
+    related = {
+        "venue": "polymarket",
+        "market_key": "democrats-2028",
+        "title": "Will the Democrats win the 2028 US Presidential Election?",
+        "one_hour_price_change": 0.02,
+        "one_day_price_change": 0.02,
+    }
+
+    candidates, meta = build_lag_candidates_with_metadata([leader], [related], min_similarity=0, min_divergence=0)
+
+    assert candidates == []
+    assert meta["resolved_or_bad_tick_leaders_skipped"] == 1
+    assert meta["max_abs_leader_move"] == 0.8
+
+
+def test_lag_candidates_skips_leader_with_no_valid_candidates_and_continues():
+    """A Japan World Cup leader only finds halftime performers → gets skipped.
+    The next leader (ceasefire) finds hostage-release → supplies the output."""
+    wc_leader = {
+        "title": "Will Japan win the 2026 FIFA World Cup?",
+        "market_key": "japan-wc",
+        "one_hour_price_change": -0.9,
+        "one_day_price_change": -0.9,
+    }
+    ceasefire_leader = {
+        "title": "Will a Gaza ceasefire deal happen by June 2026?",
+        "market_key": "gaza-ceasefire",
+        "one_hour_price_change": 0.4,
+        "one_day_price_change": 0.5,
+    }
+    universe = [
+        {
+            "venue": "polymarket",
+            "market_key": "taylor-halftime",
+            "title": "Will Taylor Swift perform at the 2026 World Cup halftime show?",
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+        },
+        {
+            "venue": "polymarket",
+            "market_key": "gaza-hostages",
+            "title": "Will Gaza hostages be released by June 2026?",
+            "one_hour_price_change": 0.01,
+            "one_day_price_change": 0.02,
+        },
+    ]
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        [wc_leader, ceasefire_leader],
+        universe,
+        min_similarity=0,
+        min_divergence=0,
+        max_leaders_evaluated=10,
+        include_review_only=True,
+        max_abs_leader_move=1.0,
+    )
+
+    assert meta["leaders_skipped"] >= 1
+    assert meta["skip_reasons_count"].get("no_valid_candidates", 0) >= 1
+    assert len(candidates) >= 1
+    assert candidates[0]["leader_market_id"] == "gaza-ceasefire"
+
+
+def test_lag_candidates_with_metadata_all_leaders_skipped_returns_empty():
+    leader = {
+        "title": "Will Japan win the 2026 FIFA World Cup?",
+        "market_key": "japan-wc",
+        "one_hour_price_change": -0.9,
+        "one_day_price_change": -0.9,
+    }
+    universe = [
+        {
+            "venue": "polymarket",
+            "market_key": "taylor-halftime",
+            "title": "Will Taylor Swift perform at the 2026 World Cup halftime show?",
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+        }
+    ]
+
+    candidates, meta = build_lag_candidates_with_metadata(
+        [leader], universe, min_similarity=0, min_divergence=0, max_abs_leader_move=1.0
+    )
+
+    assert candidates == []
+    assert meta["leaders_skipped"] == 1
+    assert meta["leaders_evaluated"] == 1
+    assert meta["valid_candidates_found"] == 0
+    assert "no_valid_candidates" in meta["skip_reasons_count"]
+
+
+def test_lag_candidates_debug_shows_per_leader_skip_fields():
+    leader = {
+        "title": "Will Japan win the 2026 FIFA World Cup?",
+        "market_key": "japan-wc",
+        "one_hour_price_change": -0.9,
+        "one_day_price_change": -0.9,
+    }
+    universe = [
+        {
+            "venue": "polymarket",
+            "market_key": "taylor-halftime",
+            "title": "Will Taylor Swift perform at the 2026 World Cup halftime show?",
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+        }
+    ]
+
+    debug = build_lag_candidates_debug([leader], universe, min_similarity=0, min_divergence=0, max_abs_leader_move=1.0)
+
+    assert len(debug) == 1
+    row = debug[0]
+    assert row["leader_skipped"] is True
+    assert row["skip_reason"] == "no_valid_candidates"
+    assert row["valid_candidate_count"] == 0
+    assert row["rejected_candidate_count"] >= 1
+    assert isinstance(row["top_rejection_reasons"], list)
+    assert row["best_valid_candidates"] == []
+    assert row["option_set_type"] == "winner"
+    assert row["leader_option_set_key"] is not None
+
+
+def test_lag_candidates_debug_evaluates_minimum_leaders_before_timeout(monkeypatch):
+    leaders = [
+        {
+            "title": f"Leader {idx}",
+            "market_key": f"leader-{idx}",
+            "one_hour_price_change": 0.1,
+            "one_day_price_change": 0.1,
+        }
+        for idx in range(10)
+    ]
+
+    ticks = iter([idx * 0.2 for idx in range(30)])
+    monkeypatch.setattr(lag_candidates_module.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(lag_candidates_module, "_leader_candidate_evaluations", lambda *args, **kwargs: [])
+
+    rows = build_lag_candidates_debug(
+        leaders,
+        [],
+        leader_limit=10,
+        timeout_seconds=0.1,
+        min_leaders_before_timeout=5,
+    )
+
+    assert len(rows) == 5
+    assert rows[0]["partial_results_due_to_timeout"] is True
+    assert rows[0]["leaders_evaluated_before_timeout"] == 5
+    assert rows[0]["elapsed_time_total"] > 0
 
 
 def test_debug_output_goes_to_stderr_not_stdout():
