@@ -93,6 +93,164 @@ def test_leader_markets_returns_empty_when_vardr1_unavailable(monkeypatch) -> No
     assert resp.json() == []
 
 
+def test_leader_markets_allows_suspicious_rows_without_movement_when_min_abs_move_zero(monkeypatch) -> None:
+    monkeypatch.setattr(
+        api_server,
+        "get_leader_markets",
+        lambda: [
+            api_server.normalize_leader_market(
+                {
+                    "market_id": "0xabc",
+                    "market_title": "Will suspicious market happen?",
+                    "price": 0.0868,
+                    "risk_score": 0.334,
+                    "anomaly_score": 0.605,
+                    "trade_size": 121.1,
+                    "platform": "polymarket",
+                }
+            )
+        ],
+    )
+
+    resp = client.get("/leader-markets?min_abs_move=0")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert len(payload) == 1
+    assert payload[0]["market_id"] == "0xabc"
+    assert payload[0]["current_price"] == 0.0868
+    assert payload[0]["price_change_1h"] == 0.0
+    assert payload[0]["price_change_24h"] == 0.0
+    assert payload[0]["leader_score"] == 0.605
+    assert payload[0]["recent_volume"] == 121.1
+
+
+def test_leader_markets_filters_suspicious_rows_without_movement_when_min_abs_move_positive(monkeypatch) -> None:
+    monkeypatch.setattr(
+        api_server,
+        "get_leader_markets",
+        lambda: [
+            api_server.normalize_leader_market(
+                {
+                    "market_id": "0xabc",
+                    "market_title": "Will suspicious market happen?",
+                    "price": 0.0868,
+                    "risk_score": 0.334,
+                    "anomaly_score": 0.605,
+                }
+            )
+        ],
+    )
+
+    resp = client.get("/leader-markets?min_abs_move=0.02")
+
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_leader_markets_prefers_nonzero_movement_rows(monkeypatch) -> None:
+    monkeypatch.setattr(
+        api_server,
+        "get_leader_markets",
+        lambda: [
+            api_server.normalize_leader_market(
+                {
+                    "market_id": "zero",
+                    "market_title": "Zero movement anomaly",
+                    "price": 0.2,
+                    "risk_score": 0.9,
+                }
+            ),
+            api_server.normalize_leader_market(
+                {
+                    "market_id": "move",
+                    "market_title": "Real movement leader",
+                    "current_price": 0.55,
+                    "price_change_1h": 0.04,
+                    "price_change_24h": 0.12,
+                    "leader_score": 1.0,
+                }
+            ),
+        ],
+    )
+
+    resp = client.get("/leader-markets?min_abs_move=0&limit=5")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert [row["market_id"] for row in payload] == ["zero", "move"]
+    assert payload[0]["source"] == "vardr1_anomaly_fallback"
+    assert payload[1]["price_change_24h"] == 0.12
+
+
+def test_leader_markets_filters_zero_movement_only_when_min_abs_move_positive(monkeypatch) -> None:
+    monkeypatch.setattr(
+        api_server,
+        "get_leader_markets",
+        lambda: [
+            api_server.normalize_leader_market(
+                {
+                    "market_id": "zero",
+                    "market_title": "Zero movement anomaly",
+                    "price": 0.2,
+                    "risk_score": 0.9,
+                }
+            ),
+            api_server.normalize_leader_market(
+                {
+                    "market_id": "move",
+                    "market_title": "Real movement leader",
+                    "current_price": 0.55,
+                    "price_change_1h": 0.04,
+                    "price_change_24h": 0.12,
+                    "leader_score": 1.0,
+                }
+            ),
+        ],
+    )
+
+    resp = client.get("/leader-markets?min_abs_move=0.01&limit=5")
+
+    assert resp.status_code == 200
+    assert [row["market_id"] for row in resp.json()] == ["move"]
+
+
+def test_leader_markets_filters_stale_or_resolved_by_default(monkeypatch) -> None:
+    monkeypatch.setattr(
+        api_server,
+        "get_leader_markets",
+        lambda: [
+            api_server.normalize_leader_market(
+                {
+                    "market_id": "stale",
+                    "market_title": "Stale movement leader",
+                    "current_price": 0.55,
+                    "price_change_24h": 0.30,
+                    "leader_score": 1.0,
+                    "stale_or_resolved": True,
+                }
+            ),
+            api_server.normalize_leader_market(
+                {
+                    "market_id": "active",
+                    "market_title": "Active movement leader",
+                    "current_price": 0.45,
+                    "price_change_24h": 0.05,
+                    "leader_score": 0.8,
+                    "stale_or_resolved": False,
+                }
+            ),
+        ],
+    )
+
+    resp = client.get("/leader-markets?min_abs_move=0&limit=5&debug=true")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert [row["market_id"] for row in payload["leaders"]] == ["active"]
+    assert payload["debug"]["market_rows_filtered_stale_or_resolved"] == 1
+
+
 def test_leader_markets_creates_fallback_key_and_skips_missing_title(monkeypatch) -> None:
     monkeypatch.setattr(
         api_server,
@@ -200,7 +358,7 @@ def test_lag_candidates_uses_vardr1_leaders_and_local_polymarket_universe(monkey
     assert "Leader moved" in candidate["explanation"]
     assert payload["primary_trades"]
     assert payload["claude_input"]["primary_trades"] == payload["primary_trades"]
-    assert set(payload["claude_input"]) == {"primary_trades", "review_candidates", "reasoning_context"}
+    assert set(payload["claude_input"]) == {"primary_trades", "review_candidates", "reasoning_context", "threshold_violation_signals"}
 
     meta = payload["metadata"]
     assert meta["leaders_fetched"] == 1
@@ -208,6 +366,167 @@ def test_lag_candidates_uses_vardr1_leaders_and_local_polymarket_universe(monkey
     assert meta["leaders_skipped"] == 0
     assert meta["valid_candidates_found"] == 1
     assert meta["universe_row_count"] == len(markets)
+
+
+def test_lag_candidates_claude_input_includes_enriched_leader_fields(monkeypatch) -> None:
+    raw_leader = {
+        "market_id": "0xabc123",
+        "condition_id": "0xabc123",
+        "market_title": "Will a Gaza ceasefire deal happen?",
+        "price": 0.58,
+        "anomaly_score": 0.81,
+        "risk_score": 0.31,
+    }
+    leader = api_server.normalize_leader_market(raw_leader)
+    leader["_lag_tokens"] = {"gaza", "ceasefire", "deal", "hostages", "released"}
+    markets = [
+        {
+            "venue": "polymarket",
+            "market_id": "12345",
+            "market_key": "12345",
+            "condition_id": "0xabc123",
+            "title": "Will a Gaza ceasefire deal happen?",
+            "current_price": 0.61,
+            "price_change_1h": 0.16,
+            "price_change_24h": 0.21,
+            "active": True,
+            "closed": False,
+        },
+        {
+            "venue": "polymarket",
+            "market_id": "67890",
+            "market_key": "67890",
+            "condition_id": "0xdef456",
+            "clob_token_id": "999000111",
+            "title": "Will Gaza hostages be released?",
+            "one_hour_price_change": 0.01,
+            "one_day_price_change": 0.02,
+            "current_price": 0.44,
+            "spread": 0.01,
+            "depth_top5": 100_000,
+            "_lag_tokens": {"gaza", "ceasefire", "deal", "hostages", "released"},
+        },
+    ]
+
+    monkeypatch.setattr(api_server, "get_leader_markets", lambda **_kw: [leader])
+    monkeypatch.setattr(
+        api_server,
+        "load_local_polymarket_universe_with_metadata",
+        lambda _root: (markets, {"row_count": len(markets), "source_path": "mock.parquet"}),
+    )
+    monkeypatch.setattr(api_server, "load_local_snapshot_history", lambda _root: [])
+    monkeypatch.setattr(
+        api_server,
+        "vardr1_last_fetch_metadata",
+        lambda: {
+            "leader_source_endpoint": "http://127.0.0.1:9002/api/suspicious",
+            "market_rows_loaded": 1,
+            "market_rows_with_nonzero_movement": 0,
+            "anomaly_fallback_used": True,
+        },
+    )
+
+    resp = client.get(
+        "/lag-candidates?min_similarity=0&min_divergence=0&min_similarity_for_trade=0"
+        "&min_related_abs_move_24h=0.01&limit=10"
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["primary_trades"]
+    leader_market = payload["claude_input"]["primary_trades"][0]["leader_market"]
+    lagging_market = payload["claude_input"]["primary_trades"][0]["lagging_market"]
+    assert leader_market["price_change_1h"] == 0.16
+    assert leader_market["price_change_24h"] == 0.21
+    assert leader_market["movement_source"] == "universe_match"
+    assert leader_market["anomaly_score"] == 0.81
+    assert leader_market["leader_score"] == 0.81
+    assert leader_market["enrichment_source"] == "universe_match"
+    assert leader_market["market_id_raw"] == "0xabc123"
+    assert leader_market["condition_id"] == "0xabc123"
+    assert leader_market["universe_market_id"] == "12345"
+    assert leader_market["source_id_type"] == "condition_id"
+    assert leader_market["canonical_market_key"] == "condition_id:0xabc123"
+    assert lagging_market["market_id_raw"] == "67890"
+    assert lagging_market["condition_id"] == "0xdef456"
+    assert lagging_market["clob_token_id"] == "999000111"
+    assert lagging_market["universe_market_id"] == "67890"
+    assert lagging_market["source_id_type"] == "universe_market_id"
+    assert lagging_market["canonical_market_key"] == "condition_id:0xdef456"
+    assert payload["metadata"]["leaders_enriched_with_universe_movement"] == 1
+    assert payload["metadata"]["leaders_missing_real_movement"] == 0
+
+
+def test_lag_candidates_exploratory_returns_review_for_suspicious_anomaly_leader(monkeypatch) -> None:
+    raw_leader = {
+        "ts": "2026-04-26 18:23:44+00:00",
+        "platform": "polymarket",
+        "market_id": "0x9c1a",
+        "market_title": "Russia-Ukraine Ceasefire before GTA VI?",
+        "price": 0.47,
+        "trade_size": 970.17,
+        "anomaly_score": 0.7181171196558715,
+        "raw_risk": 0.7181171196558715,
+        "risk_score": 0.30879036145202476,
+        "_window": "24h",
+        "_source_file": "suspicious_24h.csv",
+    }
+    leader = api_server.normalize_leader_market(raw_leader)
+    markets = [
+        {
+            "venue": "polymarket",
+            "market_key": "russia-sanctions",
+            "market_id": "russia-sanctions",
+            "title": "Will Russia sanctions happen before GTA VI?",
+            "question": "Will Russia sanctions happen before GTA VI?",
+            "one_hour_price_change": 0.0,
+            "one_day_price_change": 0.0,
+            "current_price": 0.31,
+            "liquidity_proxy": 1000,
+        }
+    ]
+
+    monkeypatch.setattr(api_server, "get_leader_markets", lambda **_kw: [leader])
+    monkeypatch.setattr(
+        api_server,
+        "load_local_polymarket_universe_with_metadata",
+        lambda _root: (markets, {"row_count": len(markets), "source_path": "mock.parquet"}),
+    )
+    monkeypatch.setattr(
+        api_server,
+        "vardr1_last_fetch_metadata",
+        lambda: {
+            "leader_source_endpoint": "http://127.0.0.1:9005/api/suspicious",
+            "market_rows_loaded": 1,
+            "market_rows_with_nonzero_movement": 0,
+            "anomaly_fallback_used": True,
+            "raw_leader_examples": [raw_leader],
+            "normalized_leader_examples": [leader],
+        },
+    )
+
+    resp = client.get("/lag-candidates?exploratory=true&limit=10")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["primary_trades"] == []
+    assert len(payload["review_candidates"]) >= 1
+    review = payload["review_candidates"][0]
+    assert review["leader_market"]["title"] == "Russia-Ukraine Ceasefire before GTA VI?"
+    assert review["leader_market"]["leader_score"] == 0.7181171196558715
+    assert review["leader_market"]["movement_source"] == "anomaly_score"
+    assert review["lagging_market"]["title"] == "Will Russia sanctions happen before GTA VI?"
+    assert review["relationship_type"] == "CAUSALLY_LINKED"
+    assert review["suggested_trade_direction"] == "review_only"
+    assert "anomaly/risk score" in review["review_reason"]
+    meta = payload["metadata"]
+    assert meta["skip_reasons_count"].get("low_information_leader", 0) == 0
+    assert meta["market_rows_with_nonzero_movement"] == 0
+    assert meta["universe_rows_available"] == len(markets)
+    assert meta["universe_rows_used_for_matching"] == len(markets)
+    assert meta["universe_source_path"] == "mock.parquet"
+    assert meta["raw_leader_examples"][0]["market_title"] == "Russia-Ukraine Ceasefire before GTA VI?"
+    assert meta["normalized_leader_examples"][0]["movement_source"] == "anomaly_score"
 
 
 def test_lag_candidates_demo_mode_returns_structured_candidate() -> None:
@@ -324,6 +643,60 @@ def test_lag_candidates_last_leader_page_has_no_next_offset(monkeypatch) -> None
     assert meta["leader_slice_end"] == 8
     assert meta["total_leaders_available"] == 8
     assert meta["next_leader_offset"] is None
+
+
+def test_lag_candidates_default_window_can_return_more_than_25(monkeypatch) -> None:
+    leaders = [
+        {
+            "title": f"Leader {idx}",
+            "market_key": f"leader-{idx}",
+            "one_hour_price_change": 0.12,
+            "one_day_price_change": 0.20,
+        }
+        for idx in range(80)
+    ]
+    observed = {}
+
+    monkeypatch.setattr(api_server, "get_leader_markets", lambda **_kw: leaders)
+    monkeypatch.setattr(
+        api_server,
+        "load_local_polymarket_universe_with_metadata",
+        lambda _root: ([], {"row_count": 0, "source_path": "mock.parquet"}),
+    )
+
+    def fake_build_lag_candidates_with_metadata(*, leader_markets, polymarket_universe, limit, **_kwargs):
+        observed["leader_count"] = len(leader_markets)
+        observed["limit"] = limit
+        candidates = [
+            {
+                "leader_market_id": leader["market_key"],
+                "leader_market_title": leader["title"],
+                "related_market_id": f"related-{idx}",
+                "related_market_title": f"Related {idx}",
+                "divergence_score": float(idx),
+                "trade_rank_score": float(idx),
+            }
+            for idx, leader in enumerate(leader_markets)
+        ][:limit]
+        return candidates, {
+            "leaders_fetched": len(leader_markets),
+            "leaders_evaluated": len(leader_markets),
+            "remaining_leaders_not_evaluated": 0,
+            "leaders_skipped": 0,
+            "skip_reasons_count": {},
+            "valid_candidates_found": len(candidates),
+        }
+
+    monkeypatch.setattr(api_server, "build_lag_candidates_with_metadata", fake_build_lag_candidates_with_metadata)
+
+    resp = client.get("/lag-candidates")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert observed["leader_count"] == 80
+    assert observed["limit"] == 100
+    assert len(body["candidates"]) == 80
+    assert body["metadata"]["leader_page_size"] == 100
 
 
 def test_lag_candidates_sorted_by_divergence_descending(monkeypatch) -> None:

@@ -7,6 +7,7 @@ import re
 import time
 import hashlib
 from ast import literal_eval
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -27,13 +28,14 @@ DEFAULT_MIN_SIMILARITY_FOR_TRADE = 0.60
 NEAR_ZERO_MOVE = 1e-9
 DEFAULT_MAX_ABS_LEADER_MOVE = 0.80
 DEFAULT_MAX_CANDIDATES_PER_LEADER_OUTPUT = 4
-DEFAULT_MAX_CANDIDATES_PER_EVENT_OUTPUT = 2
-DEFAULT_LEADER_FETCH_LIMIT = 100
-DEFAULT_MAX_LEADERS_EVALUATED = 25
+DEFAULT_MAX_CANDIDATES_PER_EVENT_OUTPUT = 4
+DEFAULT_LEADER_FETCH_LIMIT = 400
+DEFAULT_MAX_LEADERS_EVALUATED = 100
 DEFAULT_MIN_VALID_CANDIDATES = 1
 DEFAULT_VARDR1_MARKETS_PATH = (
     r"C:\Users\trace\market_fetcher_project\market_fetcher\Vardr-1-sandbox\data\raw\polymarket_markets.parquet"
 )
+REAL_LEADER_MOVEMENT_SOURCES = frozenset({"universe_match", "snapshot_history"})
 
 _STOPWORDS = {
     "will",
@@ -85,8 +87,11 @@ _ALIASES = {
     "soccer": "world",
 }
 
+REL_SAME_MARKET_DUPLICATE = "SAME_MARKET_DUPLICATE"
+REL_SAME_EVENT_THRESHOLD_BUCKET = "SAME_EVENT_THRESHOLD_BUCKET"
+REL_SAME_TEMPLATE_DIFFERENT_ASSET = "SAME_TEMPLATE_DIFFERENT_ASSET"
 REL_SAME_EVENT_OUTCOME = "SAME_EVENT_OUTCOME"  # legacy; no longer emitted
-REL_DUPLICATE_BUCKET = "DUPLICATE_BUCKET"
+REL_DUPLICATE_BUCKET = "DUPLICATE_BUCKET"  # legacy; prefer SAME_EVENT_THRESHOLD_BUCKET
 REL_CAUSALLY_LINKED = "CAUSALLY_LINKED"
 REL_CORRELATED_BUT_WEAK = "CORRELATED_BUT_WEAK"
 REL_UNRELATED = "UNRELATED"
@@ -107,9 +112,12 @@ STRICTLY_VALID_RELATIONSHIPS = frozenset({
 })
 EXPLORATORY_OPTIONAL_RELATIONSHIPS = frozenset({
     REL_CROSS_ROLE_SAME_ENTITY,
+    REL_CORRELATED_BUT_WEAK,
+    REL_SAME_EVENT_THRESHOLD_BUCKET,
+    REL_SAME_TEMPLATE_DIFFERENT_ASSET,
 })
 ALWAYS_INVALID_RELATIONSHIPS = frozenset({
-    REL_CORRELATED_BUT_WEAK,
+    REL_SAME_MARKET_DUPLICATE,
     REL_SHARED_EVENT_ONLY,
     REL_UNRELATED,
     REL_DUPLICATE_BUCKET,
@@ -574,6 +582,106 @@ def _numbers_and_dates(text: str | None) -> set[str]:
     return numbers | dates
 
 
+def _threshold_value(text: str | None) -> float | None:
+    if not text:
+        return None
+    normalized = str(text).lower().replace(",", "")
+    match = re.search(r"\$?\s*(\d+(?:\.\d+)?)\s*([kmb])?\b", normalized)
+    if not match:
+        return None
+    value = float(match.group(1))
+    multiplier = {"k": 1_000.0, "m": 1_000_000.0, "b": 1_000_000_000.0}.get(match.group(2) or "", 1.0)
+    return value * multiplier
+
+
+def _format_threshold(value: float) -> str:
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:g}B"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:g}M"
+    if value >= 1_000:
+        return f"{value / 1_000:g}K"
+    return f"{value:,.0f}"
+
+
+def _fdv_market_parts(title: str | None) -> tuple[str, float | None] | None:
+    if not title:
+        return None
+    text = _normalize_text(title)
+    if "fdv" not in text and "market cap" not in text and "valuation" not in text:
+        return None
+    if not re.search(r"\b(launch|day after|one day|24h|24 hour|token)\b", text):
+        return None
+
+    subject_source = text
+    split_match = re.search(r"\b(fdv|market cap|valuation)\b", text)
+    if split_match:
+        subject_source = text[: split_match.start()]
+    subject_source = re.sub(r"\b(will|the|a|an|token|project|coin|of|for|be|is|above|over|greater|than)\b", " ", subject_source)
+    subject_source = re.sub(r"\s+", " ", subject_source).strip()
+    if not subject_source:
+        return None
+    subject_tokens = [
+        token
+        for token in subject_source.split()
+        if token
+        and token not in _STOPWORDS
+        and not re.fullmatch(r"\d+(?:k|m|b)?", token)
+    ]
+    subject = " ".join(subject_tokens)
+    if not subject:
+        return None
+    return subject, _threshold_value(title)
+
+
+def _classify_fdv_relationship(
+    leader_title: str | None,
+    related_title: str | None,
+) -> tuple[str, str, str | None, str, str | None, bool, str | None] | None:
+    leader_parts = _fdv_market_parts(leader_title)
+    related_parts = _fdv_market_parts(related_title)
+    if not leader_parts or not related_parts:
+        return None
+
+    leader_subject, leader_threshold = leader_parts
+    related_subject, related_threshold = related_parts
+    if leader_subject == related_subject:
+        option_key = f"fdv:{leader_subject}"
+        if (
+            leader_threshold is not None
+            and related_threshold is not None
+            and abs(leader_threshold - related_threshold) <= 1e-9
+        ):
+            return (
+                REL_SAME_MARKET_DUPLICATE,
+                DIR_UNCLEAR,
+                None,
+                "same FDV launch market and threshold; likely duplicate listing",
+                option_key,
+                False,
+                None,
+            )
+        return (
+            REL_SAME_EVENT_THRESHOLD_BUCKET,
+            DIR_UNCLEAR,
+            None,
+            "same token FDV launch market with different threshold buckets; threshold ordering is review-only",
+            option_key,
+            False,
+            None,
+        )
+
+    return (
+        REL_SAME_TEMPLATE_DIFFERENT_ASSET,
+        DIR_UNCLEAR,
+        None,
+        "same FDV/token-launch market template but different token/project assets",
+        "fdv_token_launch_template",
+        False,
+        None,
+    )
+
+
 def _has_any(text: str | None, terms: set[str]) -> bool:
     normalized = _normalize_text(text)
     return any(re.search(rf"\b{re.escape(term)}\b", normalized) for term in terms)
@@ -669,11 +777,82 @@ def _leader_current_price(leader: dict[str, Any]) -> float | None:
     )
 
 
+def _leader_score(leader: dict[str, Any]) -> float | None:
+    return _to_float(
+        _first_present(
+            leader,
+            (
+                "leader_score",
+                "anomaly_score",
+                "risk_score",
+                "max_risk_score",
+                "raw_risk",
+                "max_raw_risk",
+            ),
+        )
+    )
+
+
+def _leader_movement_source(leader: dict[str, Any]) -> str | None:
+    source = leader.get("movement_source")
+    if source:
+        return str(source)
+    if _change(leader, "one_day_price_change") != 0.0:
+        return "one_day_price_change"
+    if _change(leader, "one_hour_price_change") != 0.0:
+        return "one_hour_price_change"
+    if leader.get("source") == "vardr1_anomaly_fallback":
+        return "anomaly_score"
+    return None
+
+
+def _leader_has_real_movement(leader: dict[str, Any]) -> bool:
+    has_nonzero_move = (
+        abs(_change(leader, "one_hour_price_change")) > NEAR_ZERO_MOVE
+        or abs(_change(leader, "one_day_price_change")) > NEAR_ZERO_MOVE
+    )
+    if not has_nonzero_move:
+        return False
+    movement_source = _leader_movement_source(leader)
+    if movement_source == "anomaly_score":
+        return False
+    if movement_source in REAL_LEADER_MOVEMENT_SOURCES:
+        return True
+    return str(leader.get("source") or "") != "vardr1_anomaly_fallback"
+
+
+def _leader_allows_anomaly_signal(leader: dict[str, Any]) -> bool:
+    title = _title(leader)
+    source = str(leader.get("source") or "")
+    movement_source = _leader_movement_source(leader)
+    if not title or _leader_has_real_movement(leader):
+        return False
+    is_confirmed_anomaly_source = (
+        source == "vardr1_anomaly_fallback"
+        or movement_source == "anomaly_score"
+        or "suspicious" in str(leader.get("leader_source_endpoint") or "")
+    )
+    if not is_confirmed_anomaly_source:
+        return False
+    # For confirmed anomaly endpoints, allow through regardless of score value.
+    # The /api/suspicious endpoint is itself the signal; score may be zero or absent.
+    score = _leader_score(leader)
+    return score is None or score >= 0.0
+
+
+def _leader_signal_strength(leader: dict[str, Any]) -> float:
+    if _leader_has_real_movement(leader):
+        return max(abs(_change(leader, "one_hour_price_change")), abs(_change(leader, "one_day_price_change")))
+    return abs(_leader_score(leader) or 0.0)
+
+
 def _leader_prefilter_skip_reason(
     leader: dict[str, Any],
     *,
     max_abs_leader_move: float = DEFAULT_MAX_ABS_LEADER_MOVE,
 ) -> str | None:
+    if not _title(leader):
+        return "missing_leader_title"
     one_hour_change = _change(leader, "one_hour_price_change")
     one_day_change = _change(leader, "one_day_price_change")
     if _resolved_or_bad_tick_candidate(leader, max_abs_leader_move=max_abs_leader_move):
@@ -681,6 +860,8 @@ def _leader_prefilter_skip_reason(
     if abs(one_hour_change) > 0.5 and abs(one_day_change) < 0.05:
         return "inconsistent_spike_candidate"
     if abs(one_day_change) < 0.01 and abs(one_hour_change) < 0.05:
+        if _leader_allows_anomaly_signal(leader):
+            return None
         return "low_information_leader"
     current_price = _leader_current_price(leader)
     if current_price is not None and (current_price < 0.02 or current_price > 0.98):
@@ -720,6 +901,17 @@ def _classify_relationship(
     related_tokens = _market_tokens(related)
     overlap = leader_tokens & related_tokens
 
+    if _same_market(leader, related):
+        return (
+            REL_SAME_MARKET_DUPLICATE,
+            DIR_UNCLEAR,
+            None,
+            "same underlying market across sources or duplicate listing",
+            None,
+            False,
+            None,
+        )
+
     # Check for same option_set_key (both winner markets with same event)
     leader_option_set_key = _extract_option_set_key(leader_title)
     related_option_set_key = _extract_option_set_key(related_title)
@@ -750,7 +942,11 @@ def _classify_relationship(
             REL_SAME_OPTION_SET_NEGATIVE_CORRELATION, DIR_NEGATIVE, None,
             "same multi-outcome event: mutually exclusive competitors in the same option set",
             key_str, False, None,
-        )
+            )
+
+    fdv_relationship = _classify_fdv_relationship(leader_title, related_title)
+    if fdv_relationship is not None:
+        return fdv_relationship
 
     # Cross-category or same-category market-type check (winner vs performer, or both same)
     if len(overlap) >= 2 and not _same_market(leader, related):
@@ -863,17 +1059,124 @@ def _market_id(market: dict[str, Any]) -> str:
     return str(
         market.get("market_key")
         or market.get("market_id")
+        or market.get("condition_id")
         or market.get("conditionId")
+        or market.get("conditionid")
         or market.get("id")
         or market.get("slug")
         or ""
     )
 
 
+def _is_hex_id(value: Any) -> bool:
+    return bool(value is not None and re.fullmatch(r"0x[0-9a-fA-F]+", str(value).strip()))
+
+
+def _is_numeric_id(value: Any) -> bool:
+    return bool(value is not None and re.fullmatch(r"\d+", str(value).strip()))
+
+
+def _clob_token_id(market: dict[str, Any]) -> str | None:
+    return _clean_key(
+        _first_present(
+            market,
+            (
+                "clob_token_id",
+                "clobTokenId",
+                "clobtokenid",
+                "token_id",
+                "tokenId",
+                "tokenid",
+                "yes_token_id",
+                "yesTokenId",
+            ),
+        )
+    )
+
+
+def _universe_market_id(market: dict[str, Any]) -> str | None:
+    explicit = _clean_key(_first_present(market, ("universe_market_id", "universeMarketId", "gamma_market_id")))
+    if explicit:
+        return explicit
+    raw = _clean_key(_first_present(market, ("market_id", "market_key", "id")))
+    if _is_numeric_id(raw):
+        return raw
+    return None
+
+
+def _id_fields(market: dict[str, Any]) -> dict[str, str | None]:
+    raw = _clean_key(_first_present(market, ("market_id_raw", "market_id", "market_key", "id")))
+    condition_id = _condition_id(market)
+    clob_token_id = _clob_token_id(market)
+    universe_market_id = _universe_market_id(market)
+    if condition_id is None and _is_hex_id(raw):
+        condition_id = raw
+    if clob_token_id is None and _is_numeric_id(_first_present(market, ("clob_token_id", "clobTokenId", "token_id", "tokenId"))):
+        clob_token_id = _clean_key(_first_present(market, ("clob_token_id", "clobTokenId", "token_id", "tokenId")))
+
+    if raw and condition_id and raw == condition_id:
+        source_id_type = "condition_id"
+    elif raw and clob_token_id and raw == clob_token_id:
+        source_id_type = "clob_token_id"
+    elif raw and universe_market_id and raw == universe_market_id:
+        source_id_type = "universe_market_id"
+    elif _is_hex_id(raw):
+        source_id_type = "condition_id"
+    elif _is_numeric_id(raw):
+        source_id_type = "universe_market_id"
+    elif condition_id and raw is None:
+        source_id_type = "condition_id"
+    elif clob_token_id and raw is None:
+        source_id_type = "clob_token_id"
+    elif universe_market_id and raw is None:
+        source_id_type = "universe_market_id"
+    else:
+        source_id_type = "unknown"
+
+    if condition_id:
+        canonical = f"condition_id:{condition_id}"
+    elif clob_token_id:
+        canonical = f"clob_token_id:{clob_token_id}"
+    elif universe_market_id:
+        canonical = f"universe_market_id:{universe_market_id}"
+    else:
+        fallback = raw or _title_match_key(market)
+        canonical = f"unknown:{fallback}" if fallback else None
+
+    return {
+        "market_id_raw": raw,
+        "condition_id": condition_id,
+        "clob_token_id": clob_token_id,
+        "universe_market_id": universe_market_id,
+        "canonical_market_key": canonical,
+        "source_id_type": source_id_type,
+    }
+
+
+def _candidate_id_fields(prefix: str, market: dict[str, Any]) -> dict[str, str | None]:
+    return {f"{prefix}_{key}": value for key, value in _id_fields(market).items()}
+
+
 def _same_market(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_fields = _id_fields(left)
+    right_fields = _id_fields(right)
+    left_canonical = left_fields.get("canonical_market_key")
+    right_canonical = right_fields.get("canonical_market_key")
+    if (
+        left_canonical
+        and right_canonical
+        and left_canonical == right_canonical
+        and not left_canonical.startswith("unknown:")
+    ):
+        return True
+    for key in ("condition_id", "clob_token_id", "universe_market_id"):
+        left_id = left_fields.get(key)
+        right_id = right_fields.get(key)
+        if left_id and right_id and left_id == right_id:
+            return True
     left_id = _market_id(left)
     right_id = _market_id(right)
-    if left_id and right_id and left_id == right_id:
+    if left_id and right_id and left_id == right_id and not (_is_hex_id(left_id) ^ _is_hex_id(right_id)):
         return True
     return bool(_normalize_text(left.get("title")) and _normalize_text(left.get("title")) == _normalize_text(right.get("title")))
 
@@ -892,6 +1195,19 @@ def _to_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _to_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n"}:
+        return False
+    return None
 
 
 def _present(value: Any) -> Any:
@@ -917,11 +1233,435 @@ def _change(market: dict[str, Any], field: str) -> float:
     value = _to_float(market.get(field))
     if value is not None:
         return value
+    if field == "one_hour_price_change":
+        value = _to_float(market.get("price_change_1h"))
+        if value is not None:
+            return value
+    if field == "one_day_price_change":
+        value = _to_float(market.get("price_change_24h"))
+        if value is not None:
+            return value
     if field == "one_day_price_change":
         value = _to_float(market.get("computed_mid_delta"))
         if value is not None:
             return value
     return 0.0
+
+
+def _clean_key(value: Any) -> str | None:
+    value = _present(value)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _condition_id(market: dict[str, Any]) -> str | None:
+    return _clean_key(_first_present(market, ("condition_id", "conditionId", "conditionid")))
+
+
+def _market_id_for_match(market: dict[str, Any]) -> str | None:
+    return _clean_key(_first_present(market, ("market_id", "market_key", "id")))
+
+
+def _title_match_key(market: dict[str, Any]) -> str | None:
+    normalized = _normalize_text(_title(market) or market.get("question"))
+    return normalized or None
+
+
+def _build_universe_match_index(
+    polymarket_universe: list[dict[str, Any]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    index: dict[str, dict[str, dict[str, Any]]] = {
+        "market_id": {},
+        "condition_id": {},
+        "title": {},
+    }
+    for row in polymarket_universe:
+        if not isinstance(row, dict):
+            continue
+        market_id = _market_id_for_match(row)
+        if market_id:
+            index["market_id"].setdefault(market_id, row)
+        condition_id = _condition_id(row)
+        if condition_id:
+            index["condition_id"].setdefault(condition_id, row)
+        title_key = _title_match_key(row)
+        if title_key:
+            index["title"].setdefault(title_key, row)
+    return index
+
+
+def _find_universe_match(
+    leader: dict[str, Any],
+    universe_index: dict[str, dict[str, dict[str, Any]]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    market_id = _market_id_for_match(leader)
+    if market_id and market_id in universe_index["market_id"]:
+        return universe_index["market_id"][market_id], "market_id"
+
+    condition_id = _condition_id(leader)
+    if condition_id and condition_id in universe_index["condition_id"]:
+        return universe_index["condition_id"][condition_id], "condition_id"
+
+    title_key = _title_match_key(leader)
+    if title_key and title_key in universe_index["title"]:
+        return universe_index["title"][title_key], "title"
+    return None, None
+
+
+def _movement_values_from_row(row: dict[str, Any]) -> tuple[float | None, float | None]:
+    one_hour = _to_float(
+        _first_present(
+            row,
+            (
+                "price_change_1h",
+                "one_hour_price_change",
+                "onehourpricechange",
+                "oneHourPriceChange",
+            ),
+        )
+    )
+    one_day = _to_float(
+        _first_present(
+            row,
+            (
+                "price_change_24h",
+                "one_day_price_change",
+                "onedaypricechange",
+                "oneDayPriceChange",
+                "computed_mid_delta",
+            ),
+        )
+    )
+    return one_hour, one_day
+
+
+def _has_nonzero_movement(one_hour: float | None, one_day: float | None) -> bool:
+    return abs(one_hour or 0.0) > NEAR_ZERO_MOVE or abs(one_day or 0.0) > NEAR_ZERO_MOVE
+
+
+def _apply_leader_movement(
+    leader: dict[str, Any],
+    *,
+    one_hour: float | None,
+    one_day: float | None,
+    movement_source: str,
+) -> None:
+    if one_hour is not None:
+        leader["price_change_1h"] = one_hour
+        leader["one_hour_price_change"] = one_hour
+    if one_day is not None:
+        leader["price_change_24h"] = one_day
+        leader["one_day_price_change"] = one_day
+        if leader.get("computed_mid_delta") is None or leader.get("movement_source") == "anomaly_score":
+            leader["computed_mid_delta"] = one_day
+    leader["movement_source"] = movement_source
+    leader["enrichment_source"] = movement_source
+    leader["_has_movement_fields"] = True
+
+
+def _copy_universe_market_fields(leader: dict[str, Any], row: dict[str, Any]) -> tuple[float | None, float | None]:
+    row_ids = _id_fields(row)
+    for field in ("condition_id", "clob_token_id", "universe_market_id"):
+        if row_ids.get(field) and not leader.get(field):
+            leader[field] = row_ids[field]
+
+    current_price = _to_float(
+        _first_present(
+            row,
+            (
+                "current_price",
+                "price",
+                "mid",
+                "last_trade_price",
+                "lasttradeprice",
+                "lastTradePrice",
+            ),
+        )
+    )
+    if current_price is not None:
+        leader["current_price"] = current_price
+        leader["price"] = current_price
+        leader["mid"] = current_price
+
+    volume = _to_float(
+        _first_present(row, ("volume", "volume_proxy", "volume24hr", "volume24hrclob", "volumenum", "recent_volume"))
+    )
+    if volume is not None:
+        leader["volume"] = volume
+        leader["volume_proxy"] = volume
+        leader["recent_volume"] = volume
+
+    liquidity = _to_float(_first_present(row, ("liquidity", "liquidity_proxy", "liquiditynum", "liquidityclob")))
+    if liquidity is not None:
+        leader["liquidity"] = liquidity
+        leader["liquidity_proxy"] = liquidity
+
+    for field in ("active", "closed", "resolved", "archived"):
+        value = _first_present(row, (field,))
+        bool_value = _to_bool(value)
+        if bool_value is not None:
+            leader[field] = bool_value
+
+    status = _first_present(row, ("status", "market_status"))
+    if status is not None:
+        leader["status"] = status
+
+    end_date = _first_present(
+        row,
+        (
+            "end_date",
+            "endDate",
+            "enddate",
+            "close_time_utc",
+            "closed_time",
+            "resolution_date",
+            "resolutionDate",
+        ),
+    )
+    if end_date is not None:
+        leader["end_date"] = end_date
+        leader["resolution_date"] = end_date
+
+    if leader.get("closed") is True or leader.get("resolved") is True or leader.get("active") is False:
+        leader["stale_or_resolved"] = True
+    elif leader.get("active") is True or leader.get("closed") is False or leader.get("resolved") is False:
+        leader["stale_or_resolved"] = False
+
+    return _movement_values_from_row(row)
+
+
+def _parse_snapshot_ts(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _snapshot_price(snapshot: dict[str, Any]) -> float | None:
+    return _to_float(
+        _first_present(
+            snapshot,
+            (
+                "current_price",
+                "price",
+                "mid",
+                "last_trade_price",
+                "lasttradeprice",
+                "lastTradePrice",
+            ),
+        )
+    )
+
+
+def _iter_snapshot_history_points(snapshot_history: list[dict[str, Any]]):
+    for run in snapshot_history:
+        if not isinstance(run, dict):
+            continue
+        run_ts = _parse_snapshot_ts(run.get("ts_utc") or run.get("run_ts_utc") or run.get("timestamp"))
+        snapshots = run.get("polymarket_snapshots")
+        if snapshots is None:
+            snapshots = run.get("snapshots", {}).get("polymarket") if isinstance(run.get("snapshots"), dict) else None
+        if not isinstance(snapshots, list):
+            continue
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+            price = _snapshot_price(snapshot)
+            if price is None:
+                continue
+            ts = _parse_snapshot_ts(snapshot.get("ts_utc") or snapshot.get("timestamp")) or run_ts
+            if ts is None:
+                continue
+            yield snapshot, ts, price
+
+
+def _build_snapshot_history_index(snapshot_history: list[dict[str, Any]] | None) -> dict[str, dict[str, list[tuple[datetime, float]]]]:
+    index: dict[str, dict[str, list[tuple[datetime, float]]]] = {
+        "market_id": {},
+        "condition_id": {},
+        "title": {},
+    }
+    if not snapshot_history:
+        return index
+    for snapshot, ts, price in _iter_snapshot_history_points(snapshot_history):
+        market_id = _market_id_for_match(snapshot)
+        if market_id:
+            index["market_id"].setdefault(market_id, []).append((ts, price))
+        condition_id = _condition_id(snapshot)
+        if condition_id:
+            index["condition_id"].setdefault(condition_id, []).append((ts, price))
+        title_key = _title_match_key(snapshot)
+        if title_key:
+            index["title"].setdefault(title_key, []).append((ts, price))
+    for keyed_points in index.values():
+        for key, points in keyed_points.items():
+            keyed_points[key] = sorted(points, key=lambda point: point[0])
+    return index
+
+
+def _history_points_for_market(
+    leader: dict[str, Any],
+    matched_row: dict[str, Any] | None,
+    history_index: dict[str, dict[str, list[tuple[datetime, float]]]],
+) -> list[tuple[datetime, float]]:
+    lookup_markets = [leader]
+    if matched_row is not None:
+        lookup_markets.append(matched_row)
+    for category, key_fn in (
+        ("market_id", _market_id_for_match),
+        ("condition_id", _condition_id),
+        ("title", _title_match_key),
+    ):
+        for market in lookup_markets:
+            key = key_fn(market)
+            if key and key in history_index[category]:
+                return history_index[category][key]
+    return []
+
+
+def _closest_prior_price(
+    points: list[tuple[datetime, float]],
+    *,
+    latest_ts: datetime,
+    horizon: timedelta,
+) -> float | None:
+    target = latest_ts - horizon
+    prior_points = [point for point in points if point[0] < latest_ts]
+    if not prior_points:
+        return None
+    return min(prior_points, key=lambda point: abs(point[0] - target))[1]
+
+
+def _derive_snapshot_movements(
+    leader: dict[str, Any],
+    matched_row: dict[str, Any] | None,
+    history_index: dict[str, dict[str, list[tuple[datetime, float]]]],
+) -> tuple[float | None, float | None]:
+    points = _history_points_for_market(leader, matched_row, history_index)
+    if len(points) < 2:
+        return None, None
+    latest_ts, latest_history_price = points[-1]
+    latest_price = _leader_current_price(leader) or latest_history_price
+    prior_1h = _closest_prior_price(points, latest_ts=latest_ts, horizon=timedelta(hours=1))
+    prior_24h = _closest_prior_price(points, latest_ts=latest_ts, horizon=timedelta(hours=24))
+    one_hour = latest_price - prior_1h if prior_1h is not None else None
+    one_day = latest_price - prior_24h if prior_24h is not None else None
+    return one_hour, one_day
+
+
+def _leader_enrichment_example(
+    leader: dict[str, Any],
+    *,
+    matched_row: dict[str, Any] | None = None,
+    match_type: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    example = {
+        "leader_market_id": _market_id(leader),
+        "leader_market_title": _title(leader),
+        "movement_source": _leader_movement_source(leader),
+        "enrichment_source": leader.get("enrichment_source"),
+        "price_change_1h": _change(leader, "one_hour_price_change"),
+        "price_change_24h": _change(leader, "one_day_price_change"),
+    }
+    if matched_row is not None:
+        example.update(
+            {
+                "match_type": match_type,
+                "matched_market_id": _market_id(matched_row),
+                "matched_market_title": _title(matched_row),
+            }
+        )
+    if reason:
+        example["reason"] = reason
+    return example
+
+
+def enrich_leader_markets_with_universe_movement(
+    leader_markets: list[dict[str, Any]],
+    polymarket_universe: list[dict[str, Any]],
+    *,
+    snapshot_history: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    universe_index = _build_universe_match_index(polymarket_universe)
+    history_index = _build_snapshot_history_index(snapshot_history)
+    enriched_leaders: list[dict[str, Any]] = []
+    universe_enriched = 0
+    snapshot_enriched = 0
+    match_examples: list[dict[str, Any]] = []
+    miss_examples: list[dict[str, Any]] = []
+
+    for raw_leader in leader_markets:
+        leader = dict(raw_leader)
+        matched_row, match_type = _find_universe_match(leader, universe_index)
+        already_has_real_movement = _leader_has_real_movement(leader)
+        one_hour: float | None = None
+        one_day: float | None = None
+
+        if matched_row is not None:
+            one_hour, one_day = _copy_universe_market_fields(leader, matched_row)
+            if not already_has_real_movement and _has_nonzero_movement(one_hour, one_day):
+                _apply_leader_movement(
+                    leader,
+                    one_hour=one_hour if one_hour is not None else 0.0,
+                    one_day=one_day if one_day is not None else 0.0,
+                    movement_source="universe_match",
+                )
+                universe_enriched += 1
+            elif "enrichment_source" not in leader:
+                leader["enrichment_source"] = "universe_match_no_movement"
+
+        if not _leader_has_real_movement(leader):
+            derived_1h, derived_24h = _derive_snapshot_movements(leader, matched_row, history_index)
+            if _has_nonzero_movement(derived_1h, derived_24h):
+                _apply_leader_movement(
+                    leader,
+                    one_hour=derived_1h if derived_1h is not None else one_hour,
+                    one_day=derived_24h if derived_24h is not None else one_day,
+                    movement_source="snapshot_history",
+                )
+                snapshot_enriched += 1
+
+        if not _leader_has_real_movement(leader):
+            leader.setdefault("price_change_1h", 0.0)
+            leader.setdefault("price_change_24h", 0.0)
+            leader.setdefault("one_hour_price_change", leader.get("price_change_1h", 0.0))
+            leader.setdefault("one_day_price_change", leader.get("price_change_24h", 0.0))
+            if _leader_movement_source(leader) is None:
+                leader["movement_source"] = "anomaly_score" if _leader_score(leader) is not None else None
+
+        if _leader_has_real_movement(leader) and len(match_examples) < 5:
+            match_examples.append(_leader_enrichment_example(leader, matched_row=matched_row, match_type=match_type))
+        elif not _leader_has_real_movement(leader) and len(miss_examples) < 5:
+            reason = "no_universe_match" if matched_row is None else "matched_market_missing_real_movement"
+            miss_examples.append(_leader_enrichment_example(leader, matched_row=matched_row, match_type=match_type, reason=reason))
+        enriched_leaders.append(leader)
+
+    movement_source_counts: dict[str, int] = {}
+    for leader in enriched_leaders:
+        source = _leader_movement_source(leader) or "unknown"
+        movement_source_counts[source] = movement_source_counts.get(source, 0) + 1
+
+    metadata = {
+        "leaders_enriched_with_universe_movement": universe_enriched,
+        "leaders_enriched_with_snapshot_movement": snapshot_enriched,
+        "leaders_missing_real_movement": sum(1 for leader in enriched_leaders if not _leader_has_real_movement(leader)),
+        "leader_enrichment_match_examples": match_examples,
+        "leader_enrichment_miss_examples": miss_examples,
+        "leader_movement_source_counts": movement_source_counts,
+        "movement_source_counts": movement_source_counts,
+    }
+    return enriched_leaders, metadata
 
 
 def _similarity_score(leader: dict[str, Any], related: dict[str, Any]) -> float:
@@ -1029,7 +1769,9 @@ def _candidate_payload(
     exploratory_match = similarity >= DEFAULT_MIN_SIMILARITY and not strong_match
     low_related_activity = abs(related_24h) < max(0.0, float(min_related_abs_move_24h))
     below_similarity_threshold = similarity < max(0.0, float(min_similarity_for_trade))
-    tradable_signal = strong_match and not low_related_activity and not below_similarity_threshold
+    leader_has_real_movement = _leader_has_real_movement(leader)
+    leader_anomaly_signal = _leader_allows_anomaly_signal(leader)
+    tradable_signal = strong_match and leader_has_real_movement and not low_related_activity and not below_similarity_threshold
 
     suggested = _suggested_trade_direction(leader_1h, leader_24h, expected_direction)
     if not tradable_signal:
@@ -1047,12 +1789,49 @@ def _candidate_payload(
     execution_risk_penalty = float(risk["risk_score"])
     trade_rank_score = round(max(0.0, float(divergence or 0.0) - (0.50 * execution_risk_penalty) + (0.20 * liquidity_score)), 6)
     trade_bucket = "primary" if tradable_signal and risk["risk_label"] != "HIGH" else "review"
+    review_reasons: list[str] = []
+    if not leader_has_real_movement and leader_anomaly_signal:
+        review_reasons.append("leader has no live 1h/24h movement; anomaly/risk score is used only for review ranking")
+    elif not leader_has_real_movement:
+        review_reasons.append("leader has no live 1h/24h movement")
+    if relationship_type == REL_CORRELATED_BUT_WEAK:
+        review_reasons.append("relationship is correlated but weak")
+    if relationship_type == REL_SAME_TEMPLATE_DIFFERENT_ASSET:
+        review_reasons.append("same market template but different asset; not a causal trade")
+    if relationship_type == REL_SAME_EVENT_THRESHOLD_BUCKET:
+        review_reasons.append("same event threshold bucket requires explicit threshold logic")
+    if relationship_type == REL_SAME_MARKET_DUPLICATE:
+        review_reasons.append("same underlying market or duplicate listing")
+    if expected_direction == DIR_UNCLEAR:
+        review_reasons.append("expected direction is unclear")
+    if low_related_activity:
+        review_reasons.append("lag market has low recent movement")
+    if below_similarity_threshold:
+        review_reasons.append(f"similarity below trade threshold {float(min_similarity_for_trade):.2f}")
+    if risk["risk_label"] == "HIGH":
+        review_reasons.append("execution risk is high")
+    if not review_reasons and trade_bucket == "review":
+        review_reasons.append("candidate did not pass primary trade criteria")
+    primary_reason = (
+        "strict primary candidate: real leader movement, directional relationship, sufficient similarity, "
+        "related-market lag, and acceptable execution risk"
+    )
+    review_reason = "; ".join(review_reasons) if review_reasons else None
 
     return {
         "leader_market_title": leader.get("title"),
         "leader_market_id": _market_id(leader),
+        **_candidate_id_fields("leader", leader),
+        "leader_current_price": _leader_current_price(leader),
+        "leader_score": _leader_score(leader),
+        "leader_anomaly_score": _to_float(leader.get("anomaly_score")),
+        "leader_movement_source": _leader_movement_source(leader),
+        "leader_score_source": leader.get("leader_score_source"),
+        "leader_enrichment_source": leader.get("enrichment_source"),
         "related_market_title": related.get("title") or related.get("question"),
         "related_market_id": _market_id(related),
+        **_candidate_id_fields("related", related),
+        "related_current_price": _to_float(_first_present(related, ("current_price", "mid", "last_trade_price"))),
         "similarity_score": similarity,
         "relationship_type": relationship_type,
         "expected_correlation_direction": expected_direction,
@@ -1079,8 +1858,11 @@ def _candidate_payload(
         "suggested_trade_direction": suggested,
         "exploratory_match": exploratory_match,
         "strong_match": strong_match,
+        "primary_trade_reason": primary_reason if trade_bucket == "primary" else None,
+        "review_reason": review_reason,
         "explanation": (
-            f"Leader moved {leader_1h:+.4f} over 1h and {leader_24h:+.4f} over 24h; "
+            f"Leader moved {leader_1h:+.4f} over 1h and {leader_24h:+.4f} over 24h "
+            f"(source: {_leader_movement_source(leader) or 'unknown'}, score: {_leader_score(leader)}); "
             f"related market moved {related_1h:+.4f} over 1h and {related_24h:+.4f} over 24h "
             f"with {relationship_type} / {expected_direction} relationship and similarity {similarity:.4f}."
         ),
@@ -1105,7 +1887,8 @@ def _leader_candidate_evaluations(
     leader_title = _title(leader)
     leader_1h = _change(leader, "one_hour_price_change")
     leader_24h = _change(leader, "one_day_price_change")
-    leader_has_move = leader_1h != 0.0 or leader_24h != 0.0
+    leader_has_move = _leader_has_real_movement(leader)
+    leader_has_anomaly_signal = _leader_allows_anomaly_signal(leader)
     
     # ===== SAFETY CHECK: If leader looks like a winner market but extraction fails, skip it =====
     leader_option_set_type, leader_option_set_key = _leader_option_set_type(leader)
@@ -1146,7 +1929,11 @@ def _leader_candidate_evaluations(
         ) = _classify_relationship(leader, related, similarity)
         related_1h = _change(related, "one_hour_price_change")
         related_24h = _change(related, "one_day_price_change")
-        if abs(leader_24h) <= NEAR_ZERO_MOVE and abs(related_24h) <= NEAR_ZERO_MOVE:
+        if (
+            abs(leader_24h) <= NEAR_ZERO_MOVE
+            and abs(related_24h) <= NEAR_ZERO_MOVE
+            and not leader_has_anomaly_signal
+        ):
             continue
         divergence = _divergence_score(
             similarity,
@@ -1158,9 +1945,9 @@ def _leader_candidate_evaluations(
         )
 
         rejection_reasons: list[str] = []
-        if not leader_has_move:
+        if not leader_has_move and not leader_has_anomaly_signal:
             rejection_reasons.append("leader has no 1h or 24h move")
-        if max(abs(leader_1h), abs(leader_24h)) < MIN_LEADER_MOVE:
+        if max(abs(leader_1h), abs(leader_24h)) < MIN_LEADER_MOVE and not leader_has_anomaly_signal:
             rejection_reasons.append(f"leader move below threshold {MIN_LEADER_MOVE:.4f}")
         if is_self_market:
             rejection_reasons.append("self-market")
@@ -1168,19 +1955,22 @@ def _leader_candidate_evaluations(
             rejection_reasons.append("duplicate outcome bucket")
         
         # Strict: Always reject invalid relationship types
-        if relationship_type in {REL_SAME_EVENT_OUTCOME, REL_DUPLICATE_BUCKET, REL_UNRELATED, REL_SHARED_EVENT_ONLY}:
+        if relationship_type in ALWAYS_INVALID_RELATIONSHIPS:
             rejection_reasons.append(f"always_invalid: {relationship_type}")
         
-        # CORRELATED_BUT_WEAK: Only allowed if include_weak_similarity=true (exploratory does NOT override)
+        # Optional relationships are review-only unless explicitly surfaced.
         if relationship_type == REL_CORRELATED_BUT_WEAK:
-            if not include_weak_similarity:
-                rejection_reasons.append("weak similarity rejected (correlated_but_weak requires include_weak_similarity=true)")
+            if not (include_weak_similarity or exploratory):
+                rejection_reasons.append("weak similarity rejected (requires exploratory=true or include_weak_similarity=true)")
+        if relationship_type in {REL_SAME_TEMPLATE_DIFFERENT_ASSET, REL_SAME_EVENT_THRESHOLD_BUCKET}:
+            if not exploratory:
+                rejection_reasons.append(f"{relationship_type} requires exploratory=true")
         
         # Expected direction must be clear (except for allowed unclear types)
         if expected_direction == DIR_UNCLEAR:
             unclear_allowed = relationship_type == REL_CROSS_ROLE_SAME_ENTITY or (
-                include_weak_similarity and relationship_type == REL_CORRELATED_BUT_WEAK
-            )
+                (include_weak_similarity or exploratory) and relationship_type == REL_CORRELATED_BUT_WEAK
+            ) or (exploratory and relationship_type in {REL_SAME_TEMPLATE_DIFFERENT_ASSET, REL_SAME_EVENT_THRESHOLD_BUCKET})
             if not unclear_allowed:
                 rejection_reasons.append("expected correlation direction unclear")
         
@@ -1213,6 +2003,14 @@ def _leader_candidate_evaluations(
                 "excluded_as_self_market": is_self_market,
                 "excluded_as_duplicate_bucket": duplicate_bucket,
                 "excluded_from_normal_output": bool(rejection_reasons),
+                "passed_title_check": bool(leader_title and (related.get("title") or related.get("question"))) and not is_self_market and not duplicate_bucket,
+                "passed_movement_check": leader_has_move or leader_has_anomaly_signal,
+                "passed_similarity_check": similarity >= min_similarity,
+                "passed_relationship_check": _is_valid_relationship_type(
+                    relationship_type,
+                    exploratory=exploratory,
+                    include_weak_similarity=include_weak_similarity,
+                ),
                 "relationship_reason": relationship_reason,
                 "rejected_reason": "; ".join(rejection_reasons) if rejection_reasons else None,
             }
@@ -1309,7 +2107,9 @@ def normalize_polymarket_universe(markets: list[dict[str, Any]]) -> list[dict[st
 
 
 def _normalize_parquet_market(row: dict[str, Any]) -> dict[str, Any]:
-    market_id = _first_present(row, ("market_id", "market_key", "conditionid", "conditionId", "id"))
+    condition_id = _first_present(row, ("condition_id", "conditionId", "conditionid"))
+    clob_token_id = _first_present(row, ("clob_token_id", "clobTokenId", "clobtokenid", "token_id", "tokenId", "tokenid"))
+    market_id = _first_present(row, ("market_id", "market_key", "id", "condition_id", "conditionid", "conditionId"))
     title = _first_present(row, ("market_title", "question", "title", "event_title"))
     best_bid = _to_float(_first_present(row, ("bestbid", "bestBid", "best_yes_bid")))
     best_ask = _to_float(_first_present(row, ("bestask", "bestAsk", "best_yes_ask")))
@@ -1325,19 +2125,34 @@ def _normalize_parquet_market(row: dict[str, Any]) -> dict[str, Any]:
         "venue": "polymarket",
         "market_id": str(market_id) if market_id is not None else "",
         "market_key": str(market_id) if market_id is not None else "",
+        "condition_id": str(condition_id) if condition_id is not None else None,
+        "clob_token_id": str(clob_token_id) if clob_token_id is not None else None,
+        "universe_market_id": str(market_id) if _is_numeric_id(market_id) else None,
         "market_title": str(title) if title is not None else None,
         "title": str(title) if title is not None else None,
         "question": _first_present(row, ("question", "market_title", "title", "event_title")),
         "slug": _first_present(row, ("slug", "event_slug")),
         "current_price": current_price,
+        "price": current_price,
         "mid": current_price,
         "spread": spread,
         "spread_reported": spread,
+        "volume": _to_float(_first_present(row, ("volume24hr", "volume24hrclob", "volumenum", "volume"))),
         "volume_proxy": _to_float(_first_present(row, ("volume24hr", "volume24hrclob", "volumenum", "volume"))),
+        "liquidity": _to_float(_first_present(row, ("liquiditynum", "liquidity", "liquidityclob"))) or 0.0,
         "liquidity_proxy": _to_float(_first_present(row, ("liquiditynum", "liquidity", "liquidityclob"))) or 0.0,
         "one_hour_price_change": _to_float(_first_present(row, ("price_change_1h", "onehourpricechange", "oneHourPriceChange"))),
         "one_day_price_change": _to_float(_first_present(row, ("price_change_24h", "onedaypricechange", "oneDayPriceChange"))),
+        "price_change_1h": _to_float(_first_present(row, ("price_change_1h", "onehourpricechange", "oneHourPriceChange"))),
+        "price_change_24h": _to_float(_first_present(row, ("price_change_24h", "onedaypricechange", "oneDayPriceChange"))),
         "last_trade_price": _to_float(_first_present(row, ("lasttradeprice", "lastTradePrice"))),
+        "active": _to_bool(_first_present(row, ("active",))),
+        "closed": _to_bool(_first_present(row, ("closed",))),
+        "resolved": _to_bool(_first_present(row, ("resolved",))),
+        "archived": _to_bool(_first_present(row, ("archived",))),
+        "status": _first_present(row, ("status", "market_status")),
+        "end_date": _first_present(row, ("end_date", "endDate", "enddate", "close_time_utc", "resolution_date", "resolutionDate")),
+        "resolution_date": _first_present(row, ("resolution_date", "resolutionDate", "end_date", "endDate", "enddate", "close_time_utc")),
     }
     normalized["_lag_tokens"] = _tokens(_market_text(normalized))
     return normalized
@@ -1356,11 +2171,26 @@ def _load_vardr1_parquet_universe_cached(path_str: str, mtime_ns: int) -> tuple[
         desired_columns = {
             "active",
             "closed",
+            "resolved",
             "archived",
+            "status",
+            "market_status",
             "market_id",
             "market_key",
+            "condition_id",
             "conditionid",
             "conditionId",
+            "clob_token_id",
+            "clobTokenId",
+            "clobtokenid",
+            "token_id",
+            "tokenId",
+            "tokenid",
+            "yes_token_id",
+            "yesTokenId",
+            "universe_market_id",
+            "universeMarketId",
+            "gamma_market_id",
             "id",
             "market_title",
             "question",
@@ -1368,6 +2198,12 @@ def _load_vardr1_parquet_universe_cached(path_str: str, mtime_ns: int) -> tuple[
             "event_title",
             "slug",
             "event_slug",
+            "end_date",
+            "endDate",
+            "enddate",
+            "close_time_utc",
+            "resolution_date",
+            "resolutionDate",
             "current_price",
             "lasttradeprice",
             "lastTradePrice",
@@ -1531,6 +2367,236 @@ def load_local_polymarket_universe(root_dir: str | Path = ".") -> list[dict[str,
     return markets
 
 
+def load_local_snapshot_history(root_dir: str | Path = ".") -> list[dict[str, Any]]:
+    env_path = os.getenv("VARDR_SNAPSHOT_HISTORY_PATH")
+    history_path = Path(env_path).expanduser() if env_path else Path(root_dir) / "data" / "history.jsonl"
+    if not history_path.exists():
+        snapshots_path = Path(root_dir) / "data" / "snapshots.json"
+        history_path = snapshots_path if snapshots_path.exists() else history_path
+    if not history_path.exists():
+        return []
+    try:
+        text = history_path.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        LOGGER.warning("failed to read snapshot history from %s: %s", history_path, exc)
+        return []
+    if not text:
+        return []
+    if text.lstrip().startswith("["):
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+    runs: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            runs.append(parsed)
+    return runs
+
+
+def _effective_max_universe(max_universe: int | None, universe_size: int) -> int:
+    if max_universe is None:
+        return max(1, int(universe_size))
+    return max(1, int(max_universe))
+
+
+def _leader_missing_fields_for_reason(leader: dict[str, Any], reason: str) -> list[str]:
+    missing: list[str] = []
+    if not _title(leader):
+        missing.append("title/question/market_title")
+    if reason == "low_information_leader":
+        if _change(leader, "one_hour_price_change") == 0.0:
+            missing.append("one_hour_price_change/price_change_1h")
+        if _change(leader, "one_day_price_change") == 0.0:
+            missing.append("one_day_price_change/price_change_24h")
+        if _leader_score(leader) is None:
+            missing.append("leader_score/anomaly_score/risk_score")
+    return missing
+
+
+def _leader_skip_example(leader: dict[str, Any], reason: str) -> dict[str, Any]:
+    return {
+        "reason": reason,
+        "missing_fields": _leader_missing_fields_for_reason(leader, reason),
+        "leader_market_title": _title(leader),
+        "leader_market_id": _market_id(leader),
+        "leader_price_change_1h": _change(leader, "one_hour_price_change"),
+        "leader_price_change_24h": _change(leader, "one_day_price_change"),
+        "leader_score": _leader_score(leader),
+        "movement_source": _leader_movement_source(leader),
+    }
+
+
+def _tally_rejection_reasons(evaluations: list[dict[str, Any]]) -> dict[str, int]:
+    tally: dict[str, int] = {}
+    for evaluation in evaluations:
+        reason_text = evaluation.get("rejected_reason")
+        if not reason_text:
+            continue
+        for reason in str(reason_text).split("; "):
+            tally[reason] = tally.get(reason, 0) + 1
+    return tally
+
+
+def _top_rejection_reasons(tally: dict[str, int], limit: int = 10) -> list[dict[str, Any]]:
+    return [
+        {"reason": reason, "count": count}
+        for reason, count in sorted(tally.items(), key=lambda item: item[1], reverse=True)[:limit]
+    ]
+
+
+def _top_similarity_debug(leader: dict[str, Any], evaluations: list[dict[str, Any]], limit: int = 10) -> dict[str, Any]:
+    return {
+        "leader_market_title": _title(leader),
+        "leader_market_id": _market_id(leader),
+        "leader_score": _leader_score(leader),
+        "movement_source": _leader_movement_source(leader),
+        "enrichment_source": leader.get("enrichment_source"),
+        "matches": [
+            {
+                "related_market_title": evaluation.get("related_market_title"),
+                "related_market_id": evaluation.get("related_market_id"),
+                "similarity_score": evaluation.get("similarity_score"),
+                "relationship_type": evaluation.get("relationship_type"),
+                "expected_correlation_direction": evaluation.get("expected_correlation_direction"),
+                "rejected_reason": evaluation.get("rejected_reason"),
+                "tradable_signal": evaluation.get("tradable_signal"),
+                "trade_bucket": evaluation.get("trade_bucket"),
+            }
+            for evaluation in evaluations[: max(1, int(limit))]
+        ],
+    }
+
+
+def _relationship_classification_example(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "leader_market_title": candidate.get("leader_market_title"),
+        "leader_market_id": candidate.get("leader_market_id"),
+        "leader_canonical_market_key": candidate.get("leader_canonical_market_key"),
+        "related_market_title": candidate.get("related_market_title"),
+        "related_market_id": candidate.get("related_market_id"),
+        "related_canonical_market_key": candidate.get("related_canonical_market_key"),
+        "relationship_type": candidate.get("relationship_type"),
+        "expected_correlation_direction": candidate.get("expected_correlation_direction"),
+        "relationship_reason": candidate.get("relationship_reason") or candidate.get("causal_link_reason"),
+        "tradable_signal": candidate.get("tradable_signal"),
+        "trade_bucket": candidate.get("trade_bucket"),
+        "review_reason": candidate.get("review_reason"),
+    }
+
+
+def _append_relationship_example(
+    examples: list[dict[str, Any]],
+    candidate: dict[str, Any],
+    *,
+    limit: int = 5,
+) -> None:
+    if len(examples) >= limit:
+        return
+    examples.append(_relationship_classification_example(candidate))
+
+
+def _add_rejected_primary_reasons(
+    counts: dict[str, int],
+    evaluation: dict[str, Any],
+) -> None:
+    if evaluation.get("tradable_signal") is True and evaluation.get("trade_bucket") == "primary":
+        return
+    for field in ("review_reason", "rejected_reason"):
+        reason_text = evaluation.get(field)
+        if not reason_text:
+            continue
+        for reason in str(reason_text).split("; "):
+            counts[reason] = counts.get(reason, 0) + 1
+
+
+def _detect_threshold_violation_from_evaluation(evaluation: dict[str, Any]) -> dict[str, Any] | None:
+    relationship_type = evaluation.get("relationship_type")
+    if relationship_type not in {REL_SAME_EVENT_THRESHOLD_BUCKET, REL_DUPLICATE_BUCKET}:
+        return None
+    leader_title = evaluation.get("leader_market_title") or ""
+    related_title = evaluation.get("related_market_title") or ""
+    leader_parts = _fdv_market_parts(leader_title)
+    related_parts = _fdv_market_parts(related_title)
+    if leader_parts and related_parts:
+        token_name = leader_parts[0]
+        leader_threshold = leader_parts[1]
+        related_threshold = related_parts[1]
+    else:
+        token_name = None
+        leader_threshold = _threshold_value(leader_title)
+        related_threshold = _threshold_value(related_title)
+    if leader_threshold is None or related_threshold is None or abs(leader_threshold - related_threshold) < 1.0:
+        return None
+    leader_price = _to_float(evaluation.get("leader_current_price"))
+    related_price = _to_float(evaluation.get("related_current_price"))
+    leader_24h = _to_float(evaluation.get("leader_price_change_24h")) or 0.0
+    related_24h = _to_float(evaluation.get("related_price_change_24h")) or 0.0
+    if leader_threshold > related_threshold:
+        high_threshold, low_threshold = leader_threshold, related_threshold
+        high_price, low_price = leader_price, related_price
+        high_24h, low_24h = leader_24h, related_24h
+    else:
+        high_threshold, low_threshold = related_threshold, leader_threshold
+        high_price, low_price = related_price, leader_price
+        high_24h, low_24h = related_24h, leader_24h
+    violations: list[str] = []
+    if high_price is not None and low_price is not None and high_price > low_price + 0.01:
+        violations.append("price_monotonicity_violation")
+    if abs(high_24h) > 0.01 and abs(low_24h) > 0.01:
+        if (high_24h > 0 and low_24h < 0) or (high_24h < 0 and low_24h > 0):
+            violations.append("movement_divergence")
+    if not violations:
+        return None
+    divergence = round(abs((high_price or 0.0) - (low_price or 0.0)), 4)
+    explanation_parts: list[str] = []
+    if "price_monotonicity_violation" in violations:
+        explanation_parts.append(
+            f"P(exceed {_format_threshold(high_threshold)}) = {(high_price or 0):.2%} > "
+            f"P(exceed {_format_threshold(low_threshold)}) = {(low_price or 0):.2%}; "
+            "higher threshold cannot have higher probability"
+        )
+    if "movement_divergence" in violations:
+        explanation_parts.append(
+            f"24h divergence: {_format_threshold(high_threshold)} moved {high_24h:+.2%}, "
+            f"{_format_threshold(low_threshold)} moved {low_24h:+.2%}"
+        )
+    return {
+        "token_name": token_name,
+        "leader_threshold": leader_threshold,
+        "related_threshold": related_threshold,
+        "high_threshold": high_threshold,
+        "low_threshold": low_threshold,
+        "high_price": high_price,
+        "low_price": low_price,
+        "leader_title": leader_title,
+        "related_title": related_title,
+        "leader_market_id": evaluation.get("leader_market_id"),
+        "related_market_id": evaluation.get("related_market_id"),
+        "leader_price": leader_price,
+        "related_price": related_price,
+        "leader_price_change_24h": leader_24h,
+        "related_price_change_24h": related_24h,
+        "high_price_change_24h": high_24h,
+        "low_price_change_24h": low_24h,
+        "violation_type": " + ".join(violations),
+        "violations": violations,
+        "divergence": divergence,
+        "explanation": "; ".join(explanation_parts),
+        "relationship_type": relationship_type,
+        "option_set_key": evaluation.get("option_set_key"),
+    }
+
+
 def build_lag_candidates_with_metadata(
     leader_markets: list[dict[str, Any]],
     polymarket_universe: list[dict[str, Any]],
@@ -1540,7 +2606,7 @@ def build_lag_candidates_with_metadata(
     limit: int = 50,
     max_leaders_evaluated: int = DEFAULT_MAX_LEADERS_EVALUATED,
     min_valid_candidates: int = DEFAULT_MIN_VALID_CANDIDATES,
-    max_universe: int = 5000,
+    max_universe: int | None = None,
     max_candidates_per_leader: int = 25,
     max_candidates_per_leader_output: int = DEFAULT_MAX_CANDIDATES_PER_LEADER_OUTPUT,
     max_candidates_per_event_output: int = DEFAULT_MAX_CANDIDATES_PER_EVENT_OUTPUT,
@@ -1552,6 +2618,7 @@ def build_lag_candidates_with_metadata(
     min_leaders_before_timeout: int = 5,
     min_related_abs_move_24h: float = DEFAULT_MIN_RELATED_ABS_MOVE_24H,
     min_similarity_for_trade: float = DEFAULT_MIN_SIMILARITY_FOR_TRADE,
+    snapshot_history: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Evaluate leaders sequentially, skipping those with no valid lag candidates.
 
@@ -1564,6 +2631,13 @@ def build_lag_candidates_with_metadata(
     fetched, evaluated, skipped, and why.
     """
     candidates: list[dict[str, Any]] = []
+    effective_include_review_only = include_review_only or exploratory
+    effective_max_universe = _effective_max_universe(max_universe, len(polymarket_universe))
+    leader_markets, leader_enrichment_metadata = enrich_leader_markets_with_universe_movement(
+        leader_markets,
+        polymarket_universe,
+        snapshot_history=snapshot_history,
+    )
     leaders_evaluated = 0
     leaders_skipped = 0
     resolved_or_bad_tick_leaders_skipped = 0
@@ -1573,6 +2647,22 @@ def build_lag_candidates_with_metadata(
     review_only_candidates_suppressed = 0
     leaders_filtered_before_evaluation = 0
     leader_prefilter_skip_reasons_count: dict[str, int] = {}
+    leader_skip_examples: list[dict[str, Any]] = []
+    candidate_rejection_tally: dict[str, int] = {}
+    candidate_filter_counts = {
+        "passed_title_check": 0,
+        "passed_movement_check": 0,
+        "passed_similarity_check": 0,
+        "passed_relationship_check": 0,
+    }
+    top_similarity_matches_by_leader: list[dict[str, Any]] = []
+    same_option_set_examples: list[dict[str, Any]] = []
+    same_template_different_asset_examples: list[dict[str, Any]] = []
+    same_event_threshold_bucket_examples: list[dict[str, Any]] = []
+    causal_link_examples: list[dict[str, Any]] = []
+    threshold_violation_signals: list[dict[str, Any]] = []
+    seen_violation_pairs: set[frozenset] = set()
+    rejected_primary_reason_counts: dict[str, int] = {}
     event_output_counts: dict[tuple[str, str], int] = {}
     skip_reasons: dict[str, int] = {}
     partial_timeout = False
@@ -1613,6 +2703,8 @@ def build_lag_candidates_with_metadata(
                         "leader_price_change_24h": _change(leader, "one_day_price_change"),
                     }
                 )
+            if len(leader_skip_examples) < 10:
+                leader_skip_examples.append(_leader_skip_example(leader, prefilter_reason))
             LOGGER.warning(
                 "lag_candidates skip prefiltered leader=%r reason=%s 1h=%s 24h=%s current_price=%s",
                 leader.get("title"),
@@ -1628,13 +2720,41 @@ def build_lag_candidates_with_metadata(
             polymarket_universe,
             min_similarity=min_similarity,
             min_divergence=min_divergence,
-            max_universe=max_universe,
+            max_universe=effective_max_universe,
+            max_candidates_per_leader=max_candidates_per_leader,
             exploratory=exploratory,
             include_weak_similarity=include_weak_similarity,
             min_related_abs_move_24h=min_related_abs_move_24h,
             min_similarity_for_trade=min_similarity_for_trade,
             deadline=deadline if enforce_deadline_for_leader else None,
         )
+        if len(top_similarity_matches_by_leader) < 3:
+            top_similarity_matches_by_leader.append(_top_similarity_debug(leader, evaluations, limit=10))
+        leader_rejection_tally = _tally_rejection_reasons(evaluations)
+        for reason, count in leader_rejection_tally.items():
+            candidate_rejection_tally[reason] = candidate_rejection_tally.get(reason, 0) + count
+        for count_key in candidate_filter_counts:
+            candidate_filter_counts[count_key] += sum(1 for evaluation in evaluations if evaluation.get(count_key))
+        for evaluation in evaluations:
+            relationship_type = evaluation.get("relationship_type")
+            if relationship_type == REL_SAME_OPTION_SET_NEGATIVE_CORRELATION:
+                _append_relationship_example(same_option_set_examples, evaluation)
+            elif relationship_type == REL_SAME_TEMPLATE_DIFFERENT_ASSET:
+                _append_relationship_example(same_template_different_asset_examples, evaluation)
+            elif relationship_type == REL_SAME_EVENT_THRESHOLD_BUCKET:
+                _append_relationship_example(same_event_threshold_bucket_examples, evaluation)
+            elif relationship_type == REL_CAUSALLY_LINKED:
+                _append_relationship_example(causal_link_examples, evaluation)
+            _add_rejected_primary_reasons(rejected_primary_reason_counts, evaluation)
+            violation = _detect_threshold_violation_from_evaluation(evaluation)
+            if violation is not None:
+                pair_key = frozenset([
+                    evaluation.get("leader_market_id") or "",
+                    evaluation.get("related_market_id") or "",
+                ])
+                if pair_key not in seen_violation_pairs:
+                    seen_violation_pairs.add(pair_key)
+                    threshold_violation_signals.append(violation)
 
         # Count only VALID candidates for leader skipping decision
         # Valid = no rejection reasons AND relationship type is acceptable
@@ -1655,6 +2775,8 @@ def build_lag_candidates_with_metadata(
             leaders_skipped += 1
             reason = "no_valid_candidates"
             skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+            if len(leader_skip_examples) < 10:
+                leader_skip_examples.append(_leader_skip_example(leader, reason))
             LOGGER.warning(
                 "lag_candidates skip leader=%r valid=%d required=%d",
                 leader.get("title"),
@@ -1666,12 +2788,13 @@ def build_lag_candidates_with_metadata(
         eligible_for_output = [
             evaluation
             for evaluation in valid_evaluations
-            if include_review_only or evaluation.get("tradable_signal", False)
+            if (effective_include_review_only or evaluation.get("tradable_signal", False))
+            and evaluation.get("relationship_type") not in {REL_SAME_EVENT_THRESHOLD_BUCKET, REL_DUPLICATE_BUCKET}
         ]
         review_only_candidates_suppressed += sum(
             1
             for evaluation in valid_evaluations
-            if not evaluation.get("tradable_signal", False) and not include_review_only
+            if not evaluation.get("tradable_signal", False) and not effective_include_review_only
         )
         leader_output_limit = max(1, int(max_candidates_per_leader_output))
         event_output_limit = max(1, int(max_candidates_per_event_output))
@@ -1732,12 +2855,28 @@ def build_lag_candidates_with_metadata(
         "candidates_suppressed_by_event_cap": candidates_suppressed_by_event_cap,
         "max_candidates_per_leader_output": max_candidates_per_leader_output,
         "max_candidates_per_event_output": max_candidates_per_event_output,
+        "max_universe": max_universe,
+        "universe_rows_available": len(polymarket_universe),
+        "universe_rows_used_for_matching": min(len(polymarket_universe), effective_max_universe),
         "max_abs_leader_move": max_abs_leader_move,
         "include_review_only": include_review_only,
+        "effective_include_review_only": effective_include_review_only,
+        "exploratory": exploratory,
+        "include_weak_similarity": include_weak_similarity,
         "resolved_or_bad_tick_leaders_skipped": resolved_or_bad_tick_leaders_skipped,
         "resolved_or_bad_tick_skip_examples": resolved_or_bad_tick_skip_examples,
         "leaders_filtered_before_evaluation": leaders_filtered_before_evaluation,
         "leader_prefilter_skip_reasons_count": leader_prefilter_skip_reasons_count,
+        "leader_skip_examples": leader_skip_examples,
+        **leader_enrichment_metadata,
+        "same_option_set_examples": same_option_set_examples,
+        "same_template_different_asset_examples": same_template_different_asset_examples,
+        "same_event_threshold_bucket_examples": same_event_threshold_bucket_examples,
+        "causal_link_examples": causal_link_examples,
+        "rejected_primary_reason_counts": rejected_primary_reason_counts,
+        "top_candidate_rejection_reasons": _top_rejection_reasons(candidate_rejection_tally),
+        "top_similarity_matches_by_leader": top_similarity_matches_by_leader,
+        **candidate_filter_counts,
         "events_represented_count": len(output_event_keys),
         "unique_leaders_in_output": len(output_leader_ids),
         "tradable_signals_count": sum(1 for candidate in candidates if candidate.get("tradable_signal", False)),
@@ -1747,6 +2886,8 @@ def build_lag_candidates_with_metadata(
         "min_leaders_before_timeout": min_leaders_before_timeout,
         "min_related_abs_move_24h": min_related_abs_move_24h,
         "min_similarity_for_trade": min_similarity_for_trade,
+        "threshold_violation_signals": threshold_violation_signals,
+        "threshold_violation_signals_count": len(threshold_violation_signals),
     }
     return candidates, metadata
 
@@ -1761,7 +2902,7 @@ def build_lag_candidates(
     max_leaders: int = 3,
     max_leaders_evaluated: int | None = None,
     min_valid_candidates: int = DEFAULT_MIN_VALID_CANDIDATES,
-    max_universe: int = 5000,
+    max_universe: int | None = None,
     max_candidates_per_leader: int = 25,
     max_candidates_per_leader_output: int = DEFAULT_MAX_CANDIDATES_PER_LEADER_OUTPUT,
     max_candidates_per_event_output: int = DEFAULT_MAX_CANDIDATES_PER_EVENT_OUTPUT,
@@ -1773,6 +2914,7 @@ def build_lag_candidates(
     min_leaders_before_timeout: int = 5,
     min_related_abs_move_24h: float = DEFAULT_MIN_RELATED_ABS_MOVE_24H,
     min_similarity_for_trade: float = DEFAULT_MIN_SIMILARITY_FOR_TRADE,
+    snapshot_history: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Return lag candidates. Skips leaders that produce no valid candidates and
     continues evaluating the next leader until the limit is reached or timeout fires.
@@ -1800,6 +2942,7 @@ def build_lag_candidates(
         min_leaders_before_timeout=min_leaders_before_timeout,
         min_related_abs_move_24h=min_related_abs_move_24h,
         min_similarity_for_trade=min_similarity_for_trade,
+        snapshot_history=snapshot_history,
     )
     return candidates
 
@@ -1813,7 +2956,7 @@ def build_lag_candidates_debug(
     min_similarity: float = DEFAULT_MIN_SIMILARITY,
     min_divergence: float = DEFAULT_MIN_DIVERGENCE,
     min_valid_candidates: int = DEFAULT_MIN_VALID_CANDIDATES,
-    max_universe: int = 5000,
+    max_universe: int | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     exploratory: bool = False,
     include_weak_similarity: bool = False,
@@ -1823,8 +2966,15 @@ def build_lag_candidates_debug(
     max_abs_leader_move: float = DEFAULT_MAX_ABS_LEADER_MOVE,
     min_related_abs_move_24h: float = DEFAULT_MIN_RELATED_ABS_MOVE_24H,
     min_similarity_for_trade: float = DEFAULT_MIN_SIMILARITY_FOR_TRADE,
+    snapshot_history: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     debug_rows: list[dict[str, Any]] = []
+    effective_max_universe = _effective_max_universe(max_universe, len(polymarket_universe))
+    leader_markets, leader_enrichment_metadata = enrich_leader_markets_with_universe_movement(
+        leader_markets,
+        polymarket_universe,
+        snapshot_history=snapshot_history,
+    )
     started_at = time.monotonic()
     deadline = started_at + max(0.1, float(timeout_seconds))
     min_leaders_before_timeout = max(0, int(min_leaders_before_timeout))
@@ -1853,11 +3003,20 @@ def build_lag_candidates_debug(
                     "leader_price_change_1h": _change(leader, "one_hour_price_change"),
                     "leader_price_change_24h": _change(leader, "one_day_price_change"),
                     "leader_current_price": _leader_current_price(leader),
+                    "leader_score": _leader_score(leader),
+                    "leader_movement_source": _leader_movement_source(leader),
+                    "leader_enrichment_source": leader.get("enrichment_source"),
                     "valid_candidate_count": 0,
                     "rejected_candidate_count": 0,
                     "top_rejection_reasons": [],
+                    "passed_title_check": 0,
+                    "passed_movement_check": 0,
+                    "passed_similarity_check": 0,
+                    "passed_relationship_check": 0,
                     "universe_source_path": universe_source_path,
                     "universe_row_count": universe_row_count if universe_row_count is not None else len(polymarket_universe),
+                    "universe_rows_available": universe_row_count if universe_row_count is not None else len(polymarket_universe),
+                    "universe_rows_used_for_matching": min(len(polymarket_universe), effective_max_universe),
                     "number_of_local_universe_markets_searched": len(polymarket_universe),
                     "prefiltered_universe_count": 0,
                     "max_universe": max_universe,
@@ -1866,13 +3025,13 @@ def build_lag_candidates_debug(
                 }
             )
             continue
-        prefiltered_universe = _prefilter_universe(leader, polymarket_universe, max_universe=max_universe)
+        prefiltered_universe = _prefilter_universe(leader, polymarket_universe, max_universe=effective_max_universe)
         evaluations = _leader_candidate_evaluations(
             leader,
             prefiltered_universe,
             min_similarity=min_similarity,
             min_divergence=min_divergence,
-            max_universe=max_universe,
+            max_universe=effective_max_universe,
             max_candidates_per_leader=max(1, int(top_candidates)),
             exploratory=exploratory,
             include_weak_similarity=include_weak_similarity,
@@ -1897,6 +3056,12 @@ def build_lag_candidates_debug(
         
         rejected_evaluations = [e for e in evaluations if e["rejected_reason"] is not None]
         leader_skipped = len(valid_evaluations) < min_valid_candidates
+        filter_counts = {
+            "passed_title_check": sum(1 for e in evaluations if e.get("passed_title_check")),
+            "passed_movement_check": sum(1 for e in evaluations if e.get("passed_movement_check")),
+            "passed_similarity_check": sum(1 for e in evaluations if e.get("passed_similarity_check")),
+            "passed_relationship_check": sum(1 for e in evaluations if e.get("passed_relationship_check")),
+        }
 
         rejection_tally: dict[str, int] = {}
         for e in rejected_evaluations:
@@ -1920,11 +3085,17 @@ def build_lag_candidates_debug(
                 "leader_price_change_1h": _change(leader, "one_hour_price_change"),
                 "leader_price_change_24h": _change(leader, "one_day_price_change"),
                 "leader_current_price": _leader_current_price(leader),
+                "leader_score": _leader_score(leader),
+                "leader_movement_source": _leader_movement_source(leader),
+                "leader_enrichment_source": leader.get("enrichment_source"),
                 "valid_candidate_count": len(valid_evaluations),
                 "rejected_candidate_count": len(rejected_evaluations),
                 "top_rejection_reasons": top_rejection_reasons,
+                **filter_counts,
                 "universe_source_path": universe_source_path,
                 "universe_row_count": universe_row_count if universe_row_count is not None else len(polymarket_universe),
+                "universe_rows_available": universe_row_count if universe_row_count is not None else len(polymarket_universe),
+                "universe_rows_used_for_matching": min(len(polymarket_universe), effective_max_universe),
                 "number_of_local_universe_markets_searched": len(polymarket_universe),
                 "prefiltered_universe_count": len(prefiltered_universe),
                 "max_universe": max_universe,
@@ -1967,6 +3138,10 @@ def build_lag_candidates_debug(
                         "excluded_from_normal_output": evaluation["excluded_from_normal_output"],
                         "excluded_as_self_market": evaluation["excluded_as_self_market"],
                         "excluded_as_duplicate_bucket": evaluation["excluded_as_duplicate_bucket"],
+                        "passed_title_check": evaluation["passed_title_check"],
+                        "passed_movement_check": evaluation["passed_movement_check"],
+                        "passed_similarity_check": evaluation["passed_similarity_check"],
+                        "passed_relationship_check": evaluation["passed_relationship_check"],
                     }
                     for evaluation in evaluations[: max(1, int(top_candidates))]
                 ],
@@ -1976,6 +3151,7 @@ def build_lag_candidates_debug(
     if partial_timeout and leaders_evaluated_before_timeout == 0:
         leaders_evaluated_before_timeout = leaders_evaluated
     for row in debug_rows:
+        row.update(leader_enrichment_metadata)
         row["elapsed_time_total"] = elapsed_time_total
         row["leaders_evaluated_before_timeout"] = leaders_evaluated_before_timeout
         row["partial_results_due_to_timeout"] = partial_timeout

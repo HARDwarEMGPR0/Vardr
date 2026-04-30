@@ -33,8 +33,9 @@ from market_fetcher.lag_candidates import (
     build_lag_candidates_debug,
     build_lag_candidates_with_metadata,
     load_local_polymarket_universe_with_metadata,
+    load_local_snapshot_history,
 )
-from market_fetcher.vardr1_client import map_vardr1_market_to_leader
+from market_fetcher.vardr1_client import map_vardr1_market_to_leader, vardr1_last_fetch_metadata
 from src.market_resolver import TradeIntent, resolve_trade_detailed
 
 LOGGER = logging.getLogger(__name__)
@@ -43,6 +44,30 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 app = FastAPI(title="True Markets Resolver API", version="1.0.0")
 
 LEADER_MARKET_FIELDS = (
+    "market_id",
+    "condition_id",
+    "clob_token_id",
+    "universe_market_id",
+    "market_title",
+    "current_price",
+    "price",
+    "price_change_1h",
+    "price_change_24h",
+    "leader_score",
+    "leader_score_source",
+    "movement_source",
+    "enrichment_source",
+    "risk_score",
+    "anomaly_score",
+    "platform",
+    "recent_volume",
+    "volume",
+    "liquidity",
+    "active",
+    "closed",
+    "resolved",
+    "end_date",
+    "resolution_date",
     "title",
     "market_key",
     "reference_event",
@@ -52,6 +77,7 @@ LEADER_MARKET_FIELDS = (
     "one_day_price_change",
     "source",
     "reason",
+    "stale_or_resolved",
 )
 
 app.add_middleware(
@@ -107,11 +133,19 @@ def _fallback_market_key(title: str) -> str:
 
 
 def _best_leader_move(market: dict) -> float | None:
-    for field in ("computed_mid_delta", "one_hour_price_change", "one_day_price_change"):
+    values = []
+    for field in ("price_change_1h", "price_change_24h", "one_hour_price_change", "one_day_price_change", "computed_mid_delta"):
         value = market.get(field)
         if value is not None:
-            return float(value)
-    return None
+            values.append(float(value))
+    if not values:
+        return None
+    return max(values, key=lambda value: abs(value))
+
+
+def _leader_has_nonzero_move(market: dict) -> bool:
+    move = _best_leader_move(market)
+    return move is not None and abs(move) > 0
 
 
 def normalize_leader_market(raw: dict) -> dict:
@@ -178,22 +212,40 @@ def _candidate_trade_view(candidate: dict[str, Any]) -> dict[str, Any]:
     divergence = rounded(candidate.get("divergence_score"))
     confidence = rounded(candidate.get("trade_rank_score"))
     trade_rank_score = rounded(candidate.get("trade_rank_score"))
-    reason = (
-        "The leader market moved sharply while the related market barely moved, despite a "
-        f"{candidate.get('expected_correlation_direction')} causal relationship. Because execution risk is "
-        f"{candidate.get('execution_risk_label')}, Vardr flags the related market as a "
-        f"{candidate.get('trade_bucket')} trade candidate."
-    )
+    is_primary = candidate.get("trade_bucket") == "primary" and candidate.get("tradable_signal") is True
+    reason = candidate.get("primary_trade_reason") if is_primary else candidate.get("review_reason")
+    if not reason:
+        reason = (
+            "Primary trade" if is_primary else "Review-only candidate"
+        ) + f" based on {candidate.get('relationship_type')} relationship and similarity {similarity_score}."
     return {
         "leader_market": {
             "market_id": candidate.get("leader_market_id"),
+            "market_id_raw": candidate.get("leader_market_id_raw"),
+            "condition_id": candidate.get("leader_condition_id"),
+            "clob_token_id": candidate.get("leader_clob_token_id"),
+            "universe_market_id": candidate.get("leader_universe_market_id"),
+            "canonical_market_key": candidate.get("leader_canonical_market_key"),
+            "source_id_type": candidate.get("leader_source_id_type"),
             "title": candidate.get("leader_market_title"),
+            "current_price": candidate.get("leader_current_price"),
             "price_change_1h": candidate.get("leader_price_change_1h"),
             "price_change_24h": candidate.get("leader_price_change_24h"),
+            "leader_score": candidate.get("leader_score"),
+            "anomaly_score": candidate.get("leader_anomaly_score"),
+            "movement_source": candidate.get("leader_movement_source"),
+            "enrichment_source": candidate.get("leader_enrichment_source"),
         },
         "lagging_market": {
             "market_id": candidate.get("related_market_id"),
+            "market_id_raw": candidate.get("related_market_id_raw"),
+            "condition_id": candidate.get("related_condition_id"),
+            "clob_token_id": candidate.get("related_clob_token_id"),
+            "universe_market_id": candidate.get("related_universe_market_id"),
+            "canonical_market_key": candidate.get("related_canonical_market_key"),
+            "source_id_type": candidate.get("related_source_id_type"),
             "title": candidate.get("related_market_title"),
+            "current_price": candidate.get("related_current_price"),
             "price_change_1h": candidate.get("related_price_change_1h"),
             "price_change_24h": candidate.get("related_price_change_24h"),
         },
@@ -209,13 +261,15 @@ def _candidate_trade_view(candidate: dict[str, Any]) -> dict[str, Any]:
         "liquidity_score": rounded(candidate.get("liquidity_score")),
         "trade_rank_score": trade_rank_score,
         "trade_bucket": candidate.get("trade_bucket"),
+        "is_primary_trade": is_primary,
         "execution_risk": {
             "risk_score": execution_risk_score,
             "risk_label": candidate.get("execution_risk_label"),
             "drivers": candidate.get("execution_risk_drivers"),
         },
         "reason": reason,
-        "trade_reason": reason,
+        "trade_reason": candidate.get("primary_trade_reason") if is_primary else None,
+        "review_reason": None if is_primary else reason,
         "data_source": candidate.get("data_source") or candidate.get("source") or "live",
     }
 
@@ -267,31 +321,56 @@ def health() -> dict[str, bool]:
 @app.get("/leader-markets")
 def leader_markets(
     limit: int = Query(default=10, ge=1),
-    min_abs_move: float = Query(default=0.02, ge=0.0),
-) -> list[dict]:
+    min_abs_move: float = Query(default=0.0, ge=0.0),
+    debug: bool = Query(default=False),
+) -> Any:
+    raw_leaders = [market for market in get_leader_markets() if market and market.get("title")]
+    fetch_metadata = vardr1_last_fetch_metadata()
+    stale_filtered = sum(1 for market in raw_leaders if market.get("stale_or_resolved") is True)
+    active_leaders = [market for market in raw_leaders if market.get("stale_or_resolved") is not True]
+    movement_leaders = [market for market in active_leaders if _leader_has_nonzero_move(market)]
+    if min_abs_move == 0:
+        candidate_pool = active_leaders
+    elif movement_leaders:
+        candidate_pool = movement_leaders
+    else:
+        candidate_pool = []
     leaders = []
-    for market in get_leader_markets():
+    for market in candidate_pool:
         move = _best_leader_move(market)
-        if move is None or abs(move) < min_abs_move:
+        if move is None:
+            if min_abs_move > 0:
+                continue
+        elif abs(move) < min_abs_move:
             continue
         leaders.append({field: market.get(field) for field in LEADER_MARKET_FIELDS})
         if len(leaders) >= limit:
             break
-    return leaders
+    if not debug:
+        return leaders
+    return {
+        "leaders": leaders,
+        "debug": {
+            **fetch_metadata,
+            "market_rows_filtered_stale_or_resolved": stale_filtered,
+            "active_rows_considered": len(active_leaders),
+            "nonzero_movement_rows_considered": len(movement_leaders),
+        },
+    }
 
 
 @app.get("/lag-candidates")
 def lag_candidates(
-    limit: int = Query(default=50, ge=1),
+    limit: int = Query(default=100, ge=1),
     min_similarity: float = Query(default=DEFAULT_MIN_SIMILARITY, ge=0.0, le=1.0),
     min_divergence: float = Query(default=DEFAULT_MIN_DIVERGENCE, ge=0.0),
     leader_fetch_limit: int = Query(default=DEFAULT_LEADER_FETCH_LIMIT, ge=1),
     leader_offset: int = Query(default=0, ge=0),
-    leader_page_size: int = Query(default=25, ge=1, le=50),
+    leader_page_size: int = Query(default=100, ge=1, le=400),
     max_leaders_evaluated: int = Query(default=DEFAULT_MAX_LEADERS_EVALUATED, ge=1),
     min_valid_candidates: int = Query(default=DEFAULT_MIN_VALID_CANDIDATES, ge=0),
-    max_universe: int = Query(default=5000, ge=1),
-    max_candidates_per_leader: int = Query(default=25, ge=1),
+    max_universe: int | None = Query(default=None, ge=1),
+    max_candidates_per_leader: int = Query(default=200, ge=1),
     max_candidates_per_leader_output: int = Query(default=DEFAULT_MAX_CANDIDATES_PER_LEADER_OUTPUT, ge=1),
     max_candidates_per_event_output: int = Query(default=DEFAULT_MAX_CANDIDATES_PER_EVENT_OUTPUT, ge=1),
     include_review_only: bool = Query(default=False),
@@ -307,17 +386,32 @@ def lag_candidates(
     start = time.monotonic()
     if demo:
         leaders, polymarket_universe, universe_metadata = _demo_lag_fixture()
+        snapshot_history = []
         leaders_done = time.monotonic()
         universe_done = leaders_done
     else:
         leaders = get_leader_markets(limit=leader_fetch_limit)
+        leader_fetch_metadata = vardr1_last_fetch_metadata()
         leaders_done = time.monotonic()
         polymarket_universe, universe_metadata = load_local_polymarket_universe_with_metadata(ROOT_DIR)
+        snapshot_history = load_local_snapshot_history(ROOT_DIR)
         universe_done = time.monotonic()
+    if demo:
+        leader_fetch_metadata = {
+            "leader_source_endpoint": "demo_snapshot",
+            "market_rows_loaded": len(leaders),
+            "market_rows_with_nonzero_movement": len(leaders),
+            "market_rows_filtered_stale_or_resolved": 0,
+            "anomaly_fallback_used": False,
+        }
     total_leaders_available = len(leaders)
     leader_slice_start = min(leader_offset, total_leaders_available)
     leader_slice_end = min(leader_slice_start + leader_page_size, total_leaders_available)
     leader_slice = leaders[leader_slice_start:leader_slice_end]
+    effective_max_universe = max_universe if max_universe is not None else len(polymarket_universe)
+    effective_include_review_only = include_review_only or exploratory
+    effective_include_weak_similarity = include_weak_similarity or exploratory
+    effective_min_similarity_for_trade = 0.30 if demo else (0.35 if exploratory else min_similarity_for_trade)
     candidates, candidate_metadata = build_lag_candidates_with_metadata(
         leader_markets=leader_slice,
         polymarket_universe=polymarket_universe,
@@ -326,21 +420,26 @@ def lag_candidates(
         limit=limit,
         max_leaders_evaluated=max_leaders_evaluated,
         min_valid_candidates=min_valid_candidates,
-        max_universe=max_universe,
+        max_universe=effective_max_universe,
         max_candidates_per_leader=max_candidates_per_leader,
         max_candidates_per_leader_output=max_candidates_per_leader_output,
         max_candidates_per_event_output=max_candidates_per_event_output,
-        include_review_only=include_review_only,
+        include_review_only=effective_include_review_only,
         max_abs_leader_move=max_abs_leader_move,
         exploratory=exploratory,
-            include_weak_similarity=include_weak_similarity,
-            timeout_seconds=timeout_seconds,
-            min_leaders_before_timeout=min_leaders_before_timeout,
-            min_related_abs_move_24h=min_related_abs_move_24h,
-            min_similarity_for_trade=0.30 if demo else min_similarity_for_trade,
-        )
+        include_weak_similarity=effective_include_weak_similarity,
+        timeout_seconds=timeout_seconds,
+        min_leaders_before_timeout=min_leaders_before_timeout,
+        min_related_abs_move_24h=min_related_abs_move_24h,
+        min_similarity_for_trade=effective_min_similarity_for_trade,
+        snapshot_history=snapshot_history,
+    )
     scoring_done = time.monotonic()
     candidate_metadata["universe_row_count"] = universe_metadata.get("row_count")
+    candidate_metadata["universe_rows_available"] = universe_metadata.get("row_count", len(polymarket_universe))
+    candidate_metadata["universe_rows_used_for_matching"] = min(len(polymarket_universe), int(effective_max_universe or len(polymarket_universe)))
+    candidate_metadata["universe_source_path"] = universe_metadata.get("source_path")
+    candidate_metadata["requested_max_universe"] = max_universe
     candidate_metadata["leader_offset"] = leader_offset
     candidate_metadata["leader_page_size"] = leader_page_size
     candidate_metadata["leader_slice_start"] = leader_slice_start
@@ -349,6 +448,7 @@ def lag_candidates(
     candidate_metadata["next_leader_offset"] = leader_slice_end if leader_slice_end < total_leaders_available else None
     candidate_metadata["demo_mode"] = demo
     candidate_metadata["data_source"] = "demo_snapshot" if demo else "live"
+    candidate_metadata.update(leader_fetch_metadata)
     if demo:
         for candidate in candidates:
             candidate["data_source"] = "demo_snapshot"
@@ -368,10 +468,13 @@ def lag_candidates(
         universe_metadata.get("source_path"),
     )
     claude_input = _claude_trade_context(candidates)
+    threshold_violation_signals = candidate_metadata.get("threshold_violation_signals", [])
+    claude_input["threshold_violation_signals"] = threshold_violation_signals
     return {
         "candidates": candidates,
         "primary_trades": claude_input["primary_trades"],
         "review_candidates": claude_input["review_candidates"],
+        "threshold_violation_signals": threshold_violation_signals,
         "reasoning_context": claude_input["reasoning_context"],
         "claude_input": claude_input,
         "metadata": candidate_metadata,
@@ -382,7 +485,7 @@ def lag_candidates(
 def lag_candidates_debug(
     leader_limit: int = Query(default=5, ge=1),
     leader_fetch_limit: int = Query(default=DEFAULT_LEADER_FETCH_LIMIT, ge=1),
-    max_universe: int = Query(default=5000, ge=1),
+    max_universe: int | None = Query(default=None, ge=1),
     top_k: int = Query(default=10, ge=1),
     min_valid_candidates: int = Query(default=DEFAULT_MIN_VALID_CANDIDATES, ge=0),
     exploratory: bool = Query(default=False),
@@ -397,9 +500,12 @@ def lag_candidates_debug(
 ) -> list[dict[str, Any]]:
     start = time.monotonic()
     leaders = get_leader_markets(limit=leader_fetch_limit)
+    leader_fetch_metadata = vardr1_last_fetch_metadata()
     leaders_done = time.monotonic()
     polymarket_universe, universe_metadata = load_local_polymarket_universe_with_metadata(ROOT_DIR)
+    snapshot_history = load_local_snapshot_history(ROOT_DIR)
     universe_done = time.monotonic()
+    effective_max_universe = max_universe if max_universe is not None else len(polymarket_universe)
     rows = build_lag_candidates_debug(
         leader_markets=leaders,
         polymarket_universe=polymarket_universe,
@@ -408,16 +514,17 @@ def lag_candidates_debug(
         min_similarity=min_similarity,
         min_divergence=min_divergence,
         min_valid_candidates=min_valid_candidates,
-        max_universe=max_universe,
+        max_universe=effective_max_universe,
         timeout_seconds=timeout_seconds,
         min_leaders_before_timeout=min_leaders_before_timeout,
         max_abs_leader_move=max_abs_leader_move,
         min_related_abs_move_24h=min_related_abs_move_24h,
-        min_similarity_for_trade=min_similarity_for_trade,
+        min_similarity_for_trade=0.40 if exploratory else min_similarity_for_trade,
         exploratory=exploratory,
         include_weak_similarity=include_weak_similarity,
         universe_source_path=universe_metadata.get("source_path"),
         universe_row_count=universe_metadata.get("row_count"),
+        snapshot_history=snapshot_history,
     )
     scoring_done = time.monotonic()
     LOGGER.warning(
@@ -430,6 +537,8 @@ def lag_candidates_debug(
         universe_metadata.get("row_count"),
         universe_metadata.get("source_path"),
     )
+    for row in rows:
+        row.update(leader_fetch_metadata)
     return rows
 
 
